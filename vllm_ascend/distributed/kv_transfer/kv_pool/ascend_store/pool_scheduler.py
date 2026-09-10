@@ -30,15 +30,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
-<<<<<<< HEAD
-    get_layerwise_kv_cache_specs,
     get_layerwise_reuse_config,
-=======
-    get_gva_layerwise_config,
     get_layerwise_base_layers,
     get_layerwise_kv_cache_specs,
     get_layerwise_physical_layer_index,
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
@@ -208,15 +203,10 @@ class KVPoolScheduler:
         local_base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.num_layers = local_base_layers
         self.layerwise_offload = False
-<<<<<<< HEAD
         if self.use_layerwise_transfer:
-            extra_config = get_layerwise_reuse_config(vllm_config.kv_transfer_config)
-=======
-        if self.use_gva_layerwise:
             base_layer_start, base_layer_end = model_config.get_layers_start_end_indices(vllm_config.parallel_config)
             expected_base_layers = set(range(base_layer_start, base_layer_end))
-            extra_config = get_gva_layerwise_config(vllm_config.kv_transfer_config)
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
+            extra_config = get_layerwise_reuse_config(vllm_config.kv_transfer_config)
             if kv_cache_config is not None and extra_config is not None:
                 layer_specs = get_layerwise_kv_cache_specs(kv_cache_config)
                 total_base_layers = model_config.get_total_num_hidden_layers()

@@ -50,7 +50,6 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-<<<<<<< HEAD
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -58,9 +57,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-=======
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
@@ -85,11 +81,7 @@ from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
-<<<<<<< HEAD
-=======
-    get_gva_layerwise_config,
     get_layerwise_base_layers,
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
     get_layerwise_physical_layer_index,
     get_layerwise_reuse_config,
 )

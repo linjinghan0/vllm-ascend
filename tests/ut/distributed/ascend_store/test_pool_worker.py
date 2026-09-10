@@ -318,7 +318,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.base_layer_end = 4
         worker.num_kv_cache_groups = 2
         worker.hf_config = SimpleNamespace(num_hidden_layers=4)
-        worker.use_gva_layerwise = True
+        worker.use_layerwise_transfer = True
         worker._extra_config = {
             "layerwise_num_shared_buffers": 1,
             "layerwise_independent_layers": [],
@@ -397,7 +397,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.base_layer_end = 4
         worker.num_kv_cache_groups = 1
         worker.hf_config = SimpleNamespace(num_hidden_layers=4)
-        worker.use_gva_layerwise = True
+        worker.use_layerwise_transfer = True
         worker._extra_config = {
             "layerwise_num_shared_buffers": 2,
             "layerwise_independent_layers": [],
@@ -438,7 +438,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.base_layer_end = 4
         worker.num_kv_cache_groups = 1
         worker.hf_config = SimpleNamespace(num_hidden_layers=4)
-        worker.use_gva_layerwise = True
+        worker.use_layerwise_transfer = True
         worker._extra_config = {
             "layerwise_num_shared_buffers": 1,
             "layerwise_independent_layers": [],

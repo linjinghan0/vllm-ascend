@@ -5,17 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, ProfilerConfig, VllmConfig
-<<<<<<< HEAD
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
+    HiddenStateCacheSpec,
 )
-=======
-from vllm.v1.kv_cache_interface import FullAttentionSpec, HiddenStateCacheSpec
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
 
 from tests.ut.base import TestBase
 from vllm_ascend.device.hardware import AscendDeviceType

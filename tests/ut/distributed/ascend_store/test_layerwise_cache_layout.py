@@ -16,11 +16,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
     get_layerwise_physical_layer_index,
-<<<<<<< HEAD
     get_layerwise_reuse_config,
-=======
     get_raw_cache_components,
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
 )
 from vllm_ascend.utils import get_kv_cache_tensor_layers, vllm_version_is
 
@@ -104,12 +101,10 @@ def test_no_reuse_skips_topology_validation():
     assert kv_cache_config.kv_cache_tensors == original_tensors
 
 
-<<<<<<< HEAD
 def test_base_layers_are_merged_into_shared_slots():
     original_tensors = [_make_kv_cache_tensor(16, [f"model.layers.{layer}.self_attn"]) for layer in range(6)]
     layer_names = [get_kv_cache_tensor_layers(tensor)[0] for tensor in original_tensors]
     spec = _make_full_attention_spec()
-=======
 def test_no_reuse_skips_multi_component_layer_validation():
     spec = MambaSpec(
         block_size=2,
@@ -124,8 +119,7 @@ def test_no_reuse_skips_multi_component_layer_validation():
         "attn",
     )
     layer_names = [f"model.layers.{layer}.self_attn.{suffix}" for layer in range(2) for suffix in suffixes]
-    original_tensors = [KVCacheTensor(size=16, shared_by=[layer_name]) for layer_name in layer_names]
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
+    original_tensors = [_make_kv_cache_tensor(16, [layer_name]) for layer_name in layer_names]
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
         kv_cache_tensors=original_tensors.copy(),
@@ -282,15 +276,11 @@ def test_incompatible_cache_specs_use_separate_slots():
     layer_specs = {layer_name: first_spec for layer_name in layer_names}
     layer_specs[layer_names[2]] = incompatible_spec
     kv_cache_config = SimpleNamespace(
-<<<<<<< HEAD
-        kv_cache_tensors=[_make_kv_cache_tensor(32, [layer_name]) for layer_name in layer_names],
-=======
         num_blocks=1,
         kv_cache_tensors=[
-            KVCacheTensor(size=layer_specs[layer_name].page_size_bytes, shared_by=[layer_name])
+            _make_kv_cache_tensor(32, shared_by=[layer_name])
             for layer_name in layer_names
         ],
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
         kv_cache_groups=[
             SimpleNamespace(
                 layer_names=layer_names,
@@ -574,13 +564,11 @@ def test_single_indexer_spec_is_the_primary_spec():
     assert [named_spec.layer_name for named_spec in layout.layer_cache_specs[0]] == [indexer_name]
 
 
-<<<<<<< HEAD
 def test_multi_main_spec_layer_selects_attn_as_main():
     main_spec = _make_sfa_main_spec()
     specs = {
         "model.layers.0.self_attn.attn": main_spec,
         "model.layers.0.self_attn.other_cache": main_spec,
-=======
 def test_arbitrary_components_are_planned_independently_per_slot():
     spec = _make_full_attention_spec()
     component_names = {
@@ -589,7 +577,6 @@ def test_arbitrary_components_are_planned_independently_per_slot():
             f"model.layers.{layer}.self_attn.component1",
         ]
         for layer in range(4)
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
     }
     component_names[3].append("model.layers.3.self_attn.component3")
     layer_names = [name for names in component_names.values() for name in names]
@@ -609,7 +596,6 @@ def test_arbitrary_components_are_planned_independently_per_slot():
     vllm_config = _make_vllm_config(4, 2)
     vllm_config.kv_transfer_config.kv_connector_extra_config["layerwise_independent_layers"] = []
 
-<<<<<<< HEAD
     layout = build_layerwise_reuse_layout(
         specs,
         1,
@@ -619,7 +605,6 @@ def test_arbitrary_components_are_planned_independently_per_slot():
     layer_specs = layout.layer_cache_specs[0]
     assert layer_specs.main.layer_name == "model.layers.0.self_attn.attn"
     assert [s.layer_name for s in layer_specs.extra_main_specs] == ["model.layers.0.self_attn.other_cache"]
-=======
     assert apply_layerwise_kv_cache_plan(kv_cache_config, vllm_config) is True
 
     assert [tensor.shared_by for tensor in kv_cache_config.kv_cache_tensors] == [
@@ -669,7 +654,7 @@ def test_actual_tensor_cannot_have_fewer_than_configured_blocks():
     layer_names = [f"model.layers.{layer}.self_attn.attn" for layer in range(2)]
     kv_cache_config = SimpleNamespace(
         num_blocks=2,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes, shared_by=[name]) for name in layer_names],
+        kv_cache_tensors=[_make_kv_cache_tensor(size=spec.page_size_bytes, shared_by=[name]) for name in layer_names],
         kv_cache_groups=[
             SimpleNamespace(
                 layer_names=layer_names,
@@ -695,7 +680,7 @@ def test_actual_tensors_can_have_different_extra_block_counts():
     kv_cache_config = SimpleNamespace(
         num_blocks=configured_num_blocks,
         kv_cache_tensors=[
-            KVCacheTensor(
+            _make_kv_cache_tensor(
                 size=spec.page_size_bytes * num_blocks,
                 shared_by=[name],
             )
@@ -744,7 +729,6 @@ def test_compatible_mixed_indexer_components_bind_one_raw_lane():
     assert len(c8_views) == 2
     assert bf16_views[0].untyped_storage().data_ptr() == c8_views[0].untyped_storage().data_ptr()
     assert c8_views[0].untyped_storage().data_ptr() == c8_views[1].untyped_storage().data_ptr()
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
 
 
 def test_multi_group_sfa_descriptors_are_merged_by_main_component():

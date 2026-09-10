@@ -209,7 +209,7 @@ class KVPoolWorker:
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.base_layer_start = 0
         self.base_layer_end = self.num_layers
-        if self.use_gva_layerwise:
+        if self.use_layerwise_transfer:
             self.base_layer_start, self.base_layer_end = model_config.get_layers_start_end_indices(parallel_config)
 
         if self.use_mla:
@@ -398,15 +398,7 @@ class KVPoolWorker:
                         effective_num_layers,
                     )
                     self.num_layers = effective_num_layers
-<<<<<<< HEAD
             if self.use_layerwise_transfer:
-                self._layerwise_reuse_layout = build_layerwise_reuse_layout(
-                    get_layerwise_kv_cache_specs(self.kv_cache_config),
-                    base_layers,
-                    self._extra_config,
-                )
-=======
-            if self.use_gva_layerwise:
                 layer_specs = get_layerwise_kv_cache_specs(self.kv_cache_config)
                 expected_base_layers = set(range(self.base_layer_start, self.base_layer_end))
                 actual_base_layers = get_layerwise_base_layers(physical_layers, total_base_layers)
@@ -418,7 +410,6 @@ class KVPoolWorker:
                     )
                     if reuse_layout.has_layer_reuse:
                         self._layerwise_reuse_layout = reuse_layout
->>>>>>> aed680d07 (fix(kv_pool): generalize layerwise KV cache reuse)
 
         if self.kv_cache_config is not None and self.num_kv_cache_groups > 1:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
