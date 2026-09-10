@@ -4444,7 +4444,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> dict[str, tuple[torch.Tensor, ...]]:
         """Allocate and bind components that share one normalized lane key."""
         expected_size = max(component.size_bytes for component in components)
-        use_legacy_shared_by_layout=vllm_version_is("0.28.0")
+        use_legacy_shared_by_layout = vllm_version_is("0.28.0")
         # New KVCacheTensor.size is the backing allocation size, not the
         # per-lane size. On main, divide by layer count to compare against
         # the per-lane expected size.

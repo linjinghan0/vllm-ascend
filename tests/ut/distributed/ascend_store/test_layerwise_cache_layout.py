@@ -147,7 +147,7 @@ def test_base_layers_are_merged_into_shared_slots():
         )
         for layer in range(6)
     ]
-    layer_names = [tensor.shared_by[0] for tensor in original_tensors]
+    layer_names = [get_kv_cache_tensor_layers(tensor)[0] for tensor in original_tensors]
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
         kv_cache_tensors=original_tensors,
@@ -336,7 +336,7 @@ def test_mtp_layer_does_not_hide_missing_base_layer():
         "model.layers.2.self_attn",
         "model.mtp.0.self_attn",
     ]
-    original_tensors = [KVCacheTensor(size=16, shared_by=[layer_name]) for layer_name in layer_names]
+    original_tensors = [_make_kv_cache_tensor(16, [layer_name]) for layer_name in layer_names]
     spec = _make_full_attention_spec()
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
@@ -441,7 +441,7 @@ def test_mtp_offset_uses_total_layers_with_pipeline_parallelism():
     ]
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes, shared_by=[name]) for name in layer_names],
+        kv_cache_tensors=[_make_kv_cache_tensor(spec.page_size_bytes, [name]) for name in layer_names],
         kv_cache_groups=[
             SimpleNamespace(
                 layer_names=layer_names,
@@ -467,7 +467,7 @@ def test_mtp_offset_uses_total_layers_with_pipeline_parallelism():
     )
 
     assert apply_layerwise_kv_cache_plan(kv_cache_config, vllm_config) is True
-    assert kv_cache_config.kv_cache_tensors[0].shared_by == layer_names
+    get_kv_cache_tensor_layers(kv_cache_config.kv_cache_tensors[0]) == layer_names
     assert get_layerwise_physical_layer_index(layer_names[0], 4) == 2
     assert get_layerwise_physical_layer_index(layer_names[2], 4) == 4
     assert sorted(layout.layer_cache_specs) == [0, 1, 2]
@@ -582,7 +582,7 @@ def test_arbitrary_components_are_planned_independently_per_slot():
     layer_names = [name for names in component_names.values() for name in names]
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes, shared_by=[name]) for name in layer_names],
+        kv_cache_tensors=[_make_kv_cache_tensor(spec.page_size_bytes, [name]) for name in layer_names],
         kv_cache_groups=[
             SimpleNamespace(
                 layer_names=layer_names,
@@ -607,7 +607,7 @@ def test_arbitrary_components_are_planned_independently_per_slot():
     assert [s.layer_name for s in layer_specs.extra_main_specs] == ["model.layers.0.self_attn.other_cache"]
     assert apply_layerwise_kv_cache_plan(kv_cache_config, vllm_config) is True
 
-    assert [tensor.shared_by for tensor in kv_cache_config.kv_cache_tensors] == [
+    [get_kv_cache_tensor_layers(tensor) for tensor in kv_cache_config.kv_cache_tensors] == [
         [component_names[0][0], component_names[2][0]],
         [component_names[0][1], component_names[2][1]],
         [component_names[1][0], component_names[3][0]],
@@ -833,11 +833,11 @@ def test_mixed_li_c8_indexers_share_one_buffer_per_main_slot():
         num_blocks=num_blocks,
         kv_cache_tensors=[
             *(
-                KVCacheTensor(size=main_spec.page_size_bytes * num_blocks, shared_by=[name])
+                _make_kv_cache_tensor(main_spec.page_size_bytes * num_blocks, [name])
                 for name in main_by_layer.values()
             ),
             *(
-                KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=[name])
+                _make_kv_cache_tensor(spec.page_size_bytes * num_blocks, [name])
                 for name, spec in indexer_specs.items()
             ),
         ],
