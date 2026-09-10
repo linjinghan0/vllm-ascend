@@ -569,6 +569,18 @@ def test_multi_main_spec_layer_selects_attn_as_main():
     specs = {
         "model.layers.0.self_attn.attn": main_spec,
         "model.layers.0.self_attn.other_cache": main_spec,
+    }
+
+        layout = build_layerwise_reuse_layout(
+        specs,
+        1,
+        {"layerwise_num_shared_buffers": 1},
+    )
+
+    layer_specs = layout.layer_cache_specs[0]
+    assert layer_specs.main.layer_name == "model.layers.0.self_attn.attn"
+    assert [s.layer_name for s in layer_specs.extra_main_specs] == ["model.layers.0.self_attn.other_cache"]
+
 def test_arbitrary_components_are_planned_independently_per_slot():
     spec = _make_full_attention_spec()
     component_names = {
@@ -596,18 +608,9 @@ def test_arbitrary_components_are_planned_independently_per_slot():
     vllm_config = _make_vllm_config(4, 2)
     vllm_config.kv_transfer_config.kv_connector_extra_config["layerwise_independent_layers"] = []
 
-    layout = build_layerwise_reuse_layout(
-        specs,
-        1,
-        {"layerwise_num_shared_buffers": 1},
-    )
-
-    layer_specs = layout.layer_cache_specs[0]
-    assert layer_specs.main.layer_name == "model.layers.0.self_attn.attn"
-    assert [s.layer_name for s in layer_specs.extra_main_specs] == ["model.layers.0.self_attn.other_cache"]
     assert apply_layerwise_kv_cache_plan(kv_cache_config, vllm_config) is True
 
-    [get_kv_cache_tensor_layers(tensor) for tensor in kv_cache_config.kv_cache_tensors] == [
+    assert [get_kv_cache_tensor_layers(tensor) for tensor in kv_cache_config.kv_cache_tensors] == [
         [component_names[0][0], component_names[2][0]],
         [component_names[0][1], component_names[2][1]],
         [component_names[1][0], component_names[3][0]],
