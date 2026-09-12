@@ -101,10 +101,6 @@ def test_no_reuse_skips_topology_validation():
     assert kv_cache_config.kv_cache_tensors == original_tensors
 
 
-def test_base_layers_are_merged_into_shared_slots():
-    original_tensors = [_make_kv_cache_tensor(16, [f"model.layers.{layer}.self_attn"]) for layer in range(6)]
-    layer_names = [get_kv_cache_tensor_layers(tensor)[0] for tensor in original_tensors]
-    spec = _make_full_attention_spec()
 def test_no_reuse_skips_multi_component_layer_validation():
     spec = MambaSpec(
         block_size=2,
@@ -141,9 +137,9 @@ def test_no_reuse_skips_multi_component_layer_validation():
 def test_base_layers_are_merged_into_shared_slots():
     spec = _make_full_attention_spec()
     original_tensors = [
-        KVCacheTensor(
+        _make_kv_cache_tensor(
             size=spec.page_size_bytes,
-            shared_by=[f"model.layers.{layer}.self_attn"],
+            layer_names=[f"model.layers.{layer}.self_attn"],
         )
         for layer in range(6)
     ]
@@ -278,7 +274,7 @@ def test_incompatible_cache_specs_use_separate_slots():
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
         kv_cache_tensors=[
-            _make_kv_cache_tensor(32, shared_by=[layer_name])
+            _make_kv_cache_tensor(32, layer_names=[layer_name])
             for layer_name in layer_names
         ],
         kv_cache_groups=[
@@ -367,9 +363,9 @@ def test_wrong_pp_base_layers_do_not_enable_tensor_merge():
         "model.mtp.0.self_attn",
     ]
     original_tensors = [
-        KVCacheTensor(
+        _make_kv_cache_tensor(
             size=spec.page_size_bytes,
-            shared_by=[layer_name],
+            layer_names=[layer_name],
         )
         for layer_name in layer_names
     ]
@@ -467,7 +463,7 @@ def test_mtp_offset_uses_total_layers_with_pipeline_parallelism():
     )
 
     assert apply_layerwise_kv_cache_plan(kv_cache_config, vllm_config) is True
-    get_kv_cache_tensor_layers(kv_cache_config.kv_cache_tensors[0]) == layer_names
+    assert get_kv_cache_tensor_layers(kv_cache_config.kv_cache_tensors[0]) == layer_names
     assert get_layerwise_physical_layer_index(layer_names[0], 4) == 2
     assert get_layerwise_physical_layer_index(layer_names[2], 4) == 4
     assert sorted(layout.layer_cache_specs) == [0, 1, 2]
@@ -571,15 +567,17 @@ def test_multi_main_spec_layer_selects_attn_as_main():
         "model.layers.0.self_attn.other_cache": main_spec,
     }
 
-        layout = build_layerwise_reuse_layout(
+    layout = build_layerwise_reuse_layout(
         specs,
         1,
         {"layerwise_num_shared_buffers": 1},
     )
 
     layer_specs = layout.layer_cache_specs[0]
-    assert layer_specs.main.layer_name == "model.layers.0.self_attn.attn"
-    assert [s.layer_name for s in layer_specs.extra_main_specs] == ["model.layers.0.self_attn.other_cache"]
+    assert [named_spec.layer_name for named_spec in layout.layer_cache_specs[0]] == [
+    "model.layers.0.self_attn.attn",
+    "model.layers.0.self_attn.other_cache",
+    ]
 
 def test_arbitrary_components_are_planned_independently_per_slot():
     spec = _make_full_attention_spec()
@@ -657,7 +655,7 @@ def test_actual_tensor_cannot_have_fewer_than_configured_blocks():
     layer_names = [f"model.layers.{layer}.self_attn.attn" for layer in range(2)]
     kv_cache_config = SimpleNamespace(
         num_blocks=2,
-        kv_cache_tensors=[_make_kv_cache_tensor(size=spec.page_size_bytes, shared_by=[name]) for name in layer_names],
+        kv_cache_tensors=[_make_kv_cache_tensor(size=spec.page_size_bytes, layer_names=[name]) for name in layer_names],
         kv_cache_groups=[
             SimpleNamespace(
                 layer_names=layer_names,
@@ -685,7 +683,7 @@ def test_actual_tensors_can_have_different_extra_block_counts():
         kv_cache_tensors=[
             _make_kv_cache_tensor(
                 size=spec.page_size_bytes * num_blocks,
-                shared_by=[name],
+                layer_names=[name],
             )
             for name, num_blocks in zip(layer_names, actual_num_blocks, strict=True)
         ],
@@ -869,14 +867,14 @@ def test_mixed_li_c8_indexers_share_one_buffer_per_main_slot():
     main_tensors = [
         tensor
         for tensor in kv_cache_config.kv_cache_tensors
-        if not any(".indexer." in name for name in tensor.shared_by)
+        if not any(".indexer." in name for name in get_kv_cache_tensor_layers(tensor))
     ]
     indexer_tensors = [
-        tensor for tensor in kv_cache_config.kv_cache_tensors if any(".indexer." in name for name in tensor.shared_by)
+        tensor for tensor in kv_cache_config.kv_cache_tensors if any(".indexer." in name for name in get_kv_cache_tensor_layers(tensor))
     ]
     assert len(main_tensors) == 3
     assert len(indexer_tensors) == 3
-    assert [tensor.shared_by for tensor in indexer_tensors] == [
+    assert [get_kv_cache_tensor_layers(tensor) for tensor in indexer_tensors] == [
         [indexer_by_layer[0], indexer_by_layer[3]],
         [indexer_by_layer[1], indexer_by_layer[4]],
         [indexer_by_layer[2], indexer_by_layer[5]],

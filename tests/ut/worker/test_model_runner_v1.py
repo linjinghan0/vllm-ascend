@@ -1323,13 +1323,15 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         separate_config = KVCacheConfig(
             num_blocks=num_blocks,
             kv_cache_tensors=[
-                KVCacheTensor(
-                    size=bf16_spec.page_size_bytes * num_blocks,
-                    shared_by=[bf16_name],
+                _make_kv_cache_tensor(
+                    per_layer_size=bf16_spec.page_size_bytes * num_blocks,
+                    layer_names=[bf16_name],
+                    page_size=bf16_spec.page_size_bytes,
                 ),
-                KVCacheTensor(
-                    size=c8_spec.page_size_bytes * num_blocks,
-                    shared_by=[c8_name],
+                _make_kv_cache_tensor(
+                    per_layer_size=c8_spec.page_size_bytes * num_blocks,
+                    layer_names=[c8_name],
+                    page_size=c8_spec.page_size_bytes,
                 ),
             ],
             kv_cache_groups=[
@@ -1360,14 +1362,23 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                 ),
             ]
         )
+        if "shared_by" in KVCacheTensor.__dataclass_fields__:
+            _shared_tensor = KVCacheTensor(
+                size=bf16_spec.page_size_bytes * num_blocks,
+                shared_by=[c8_name, bf16_name],
+            )
+        else:
+            _shared_tensor = KVCacheTensor(
+                size=bf16_spec.page_size_bytes * num_blocks,
+                layers=[c8_name, bf16_name],
+                layer_stride=0,
+                block_stride=0,
+                offset=0,
+            )
+        
         shared_config = KVCacheConfig(
             num_blocks=num_blocks,
-            kv_cache_tensors=[
-                KVCacheTensor(
-                    size=bf16_spec.page_size_bytes * num_blocks,
-                    shared_by=[c8_name, bf16_name],
-                )
-            ],
+            kv_cache_tensors=[_shared_tensor],
             kv_cache_groups=separate_config.kv_cache_groups,
         )
 
