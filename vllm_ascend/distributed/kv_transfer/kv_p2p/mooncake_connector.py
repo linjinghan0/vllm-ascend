@@ -462,6 +462,26 @@ class KVCacheRecvingThread(threading.Thread):
         self._dsa_pd_mooncake_staging_tensor: torch.Tensor | None = None
         self._dsa_pd_mooncake_staging_bytes = 0
         self._dsa_pd_mooncake_staging_lock = threading.Lock()
+        # Host-only offloaded KV leaves the ADXL engine with no device
+        # region registered, so the device-side data channel is never
+        # established at startup; the first cross-process connect then
+        # fails on the NPU NIC socket (EI0020 -> 503900). Pre-registering
+        # the NPU staging window here keeps a device region registered
+        # before any transfer connects.
+        if any(
+            get_dsa_pd_mooncake_offloaded_kv_tensor(
+                int(t.data_ptr()), int(t.numel() * t.element_size())
+            )
+            is not None
+            for kv_tuple in kv_caches.values()
+            for t in (kv_tuple if isinstance(kv_tuple, (list, tuple)) else [kv_tuple])
+            if isinstance(t, torch.Tensor)
+        ):
+            self._ensure_dsa_pd_mooncake_staging_tensor()
+            logger.info(
+                "Pre-registered DSA PD Mooncake NPU staging buffer at startup: bytes=%s",
+                self._dsa_pd_mooncake_staging_bytes,
+            )
         self.block_stride_per_addr = block_stride_per_addr
         if kv_group2layeridx is None:
             kv_group2layeridx = {}
@@ -2862,7 +2882,18 @@ class MooncakeConnectorWorker:
             register_regions = collect_storage_merged_register_regions(kv_caches)
 
         validate_register_region_count(register_regions)
-        global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        # Offloaded (swap-backed) KV regions must stay OUT of the transfer
+        # engine: rtsHostRegister rejects swap-backed host memory during
+        # HcclCommPrepare (EL0003 invalid handle -> 503900). Those regions
+        # are served through the NPU staging window, which stays the only
+        # device region this engine registers.
+        region_ptrs, region_lengths = [], []
+        for region_ptr, region_length in zip(register_regions.ptrs, register_regions.lengths):
+            if get_dsa_pd_mooncake_offloaded_kv_tensor(int(region_ptr), int(region_length)) is not None:
+                continue
+            region_ptrs.append(region_ptr)
+            region_lengths.append(region_length)
+        global_te.register_buffer(region_ptrs, region_lengths)
 
         logger.debug(
             "Mooncake register kv caches metadata: kv_group2layeridx=%s, kv_caches_base_addr=%s, "
