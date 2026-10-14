@@ -1951,11 +1951,15 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         )
         kwargs = {k: v for k, v in kwargs.items() if k not in unknown_keys}
 
+    # The dsa section may also arrive via the pydantic-config path (kwargs);
+    # drop it so the explicit from_additional_config value below is the only one.
+    kwargs.pop("dsa_sparse_attention_config", None)
+
     new_config = AscendConfig(  # type: ignore[call-arg]
         scheduler_config=sched,
         sparse_kv_offload_config=sparse_kv,
         dsa_sparse_attention_config=DSASparseAttentionConfig.from_additional_config(
-            vc, (vc.additional_config or {}).get("dsa_sparse_attention_config", {})
+            vllm_config, (vllm_config.additional_config or {}).get("dsa_sparse_attention_config", {})
         ),
         kvpp_config=kvpp_config,
         dump_config_path=dump_config_path,
