@@ -180,10 +180,12 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
 
         events = [make_event(str(i)) for i in range(6)]
         mock_event_cls.side_effect = events
-        self.thread.engine.batch_transfer_sync_read.side_effect = lambda *a, **k: (
-            order.append("read"),
-            0,
-        )[1]
+
+        def record_read(*args, **kwargs) -> int:
+            order.append("read")
+            return 0
+
+        self.thread.engine.batch_transfer_sync_read.side_effect = record_read
 
         ret = self.thread._batch_transfer_sync_read_with_optional_staging(
             "remote:7777",
@@ -416,10 +418,12 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
 
         events = [make_event(str(i)) for i in range(6)]
         mock_event_cls.side_effect = events
-        self.thread.engine.batch_transfer_sync_read.side_effect = lambda *a, **k: (
-            order.append("read"),
-            0,
-        )[1]
+
+        def record_read(*args, **kwargs) -> int:
+            order.append("read")
+            return 0
+
+        self.thread.engine.batch_transfer_sync_read.side_effect = record_read
 
         ret = self.thread._batch_transfer_sync_read_with_optional_staging(
             "remote:7777",
