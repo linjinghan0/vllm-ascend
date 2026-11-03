@@ -5105,7 +5105,7 @@ class NPUModelRunner(GPUModelRunner):
         dsa_sparse_config = getattr(self.ascend_config, "dsa_sparse_attention_config", None)
         if getattr(dsa_sparse_config, "mode", None) == "fused_overlap":
             reset_dsa_pd_mooncake_kv_registries()
-        self._dsa_pd_mooncake_pending_offloaded_ranges = []
+        self._dsa_pd_mooncake_pending_offloaded_ranges: list[tuple[int, int]] = []
         allocation_context = kv_cache_allocation_context or nullcontext()
         with allocation_context:
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
