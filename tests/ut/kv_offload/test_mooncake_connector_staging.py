@@ -132,9 +132,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
             self.assertTrue(self.thread._dsa_pd_mooncake_staging_lock.locked())
             return 0
 
-        self.thread._batch_transfer_sync_read_with_optional_staging_unlocked = (
-            assert_lock_held
-        )
+        self.thread._batch_transfer_sync_read_with_optional_staging_unlocked = assert_lock_held
         ret = self.thread._batch_transfer_sync_read_with_optional_staging(
             "remote:7777",
             [offloaded_kv.data_ptr()],
@@ -154,9 +152,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.stream")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
-    def test_pipeline_four_banks_round_robin(
-        self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls
-    ):
+    def test_pipeline_four_banks_round_robin(self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls):
         # BANKS=4 with WINDOW=4 -> one slot per bank; 6 chunks become six
         # single-chunk reads round-robining over banks 0,1,2,3,0,1. Wrapping
         # back to a bank (read 5 -> bank 0) reclaims its slot just-in-time;
@@ -202,16 +198,27 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
             order,
             [
                 # banks 0,1,2,3: fresh banks, no waits
-                "read", "rec0",
-                "read", "rec1",
-                "read", "rec2",
-                "read", "rec3",
+                "read",
+                "rec0",
+                "read",
+                "rec1",
+                "read",
+                "rec2",
+                "read",
+                "rec3",
                 # read 5 wraps back to bank 0: reclaim slot 0 first
-                "wait0", "read", "rec4",
+                "wait0",
+                "read",
+                "rec4",
                 # read 6 wraps back to bank 1: reclaim slot 1 first
-                "wait1", "read", "rec5",
+                "wait1",
+                "read",
+                "rec5",
                 # final drain in slot order: 0,1,2,3
-                "wait4", "wait5", "wait2", "wait3",
+                "wait4",
+                "wait5",
+                "wait2",
+                "wait3",
             ],
         )
         self.assertEqual(self.thread.engine.batch_transfer_sync_read.call_count, 6)
@@ -373,9 +380,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.stream")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
-    def test_pipeline_landing_overlaps_windows(
-        self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls
-    ):
+    def test_pipeline_landing_overlaps_windows(self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls):
         # WINDOW=4 means 4 total staging slots; pipeline splits them into two
         # banks of 2, so 6 chunks become three half-window reads. b1 uses
         # bank 0 (slots 0,1), b2 flips to bank 1 (slots 2,3) with no wait at
@@ -429,13 +434,24 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
             order,
             [
                 # b1 (bank 0): read, submit, record per slot
-                "read", "rec0", "rec1",
+                "read",
+                "rec0",
+                "rec1",
                 # b2 (bank 1): bank flip -> read starts with no wait
-                "read", "rec2", "rec3",
+                "read",
+                "rec2",
+                "rec3",
                 # b3 (bank 0 again): reclaim slots 0 and 1 before overwriting
-                "wait0", "wait1", "read", "rec4", "rec5",
+                "wait0",
+                "wait1",
+                "read",
+                "rec4",
+                "rec5",
                 # final drain: slots 0,1,2,3
-                "wait4", "wait5", "wait2", "wait3",
+                "wait4",
+                "wait5",
+                "wait2",
+                "wait3",
             ],
         )
         self.assertEqual(self.thread.engine.batch_transfer_sync_read.call_count, 3)

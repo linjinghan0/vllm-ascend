@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.config import CUDAGraphMode
+
 from vllm_ascend.kv_offload.dsa_pd_mooncake import (
     clear_dsa_pd_mooncake_kv_buffer_registries_for_testing,
     empty_mooncake_cpu_kv_memory,

@@ -42,7 +42,6 @@ from vllm_ascend.kv_offload.dsa_pd_mooncake import (
     register_dsa_pd_mooncake_offloaded_kv_tensor,
 )
 
-
 ACL_MEMCPY_DEVICE_TO_DEVICE = 3
 DEFAULT_STAGING_BYTES = 2 * 1024 * 1024
 
@@ -123,9 +122,7 @@ def _make_fake_recv_thread(transfer_engine: Any, staging_bytes: int) -> Any:
     # (object.__new__ skips it); read the knobs the same way envs.py does.
     thread._landing_stream = torch.npu.Stream()
     thread._pipeline_banks = max(1, int(os.getenv("VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS", "4")))
-    thread._landing_streams = [
-        torch.npu.Stream() for _ in range(max(1, thread._pipeline_banks))
-    ]
+    thread._landing_streams = [torch.npu.Stream() for _ in range(max(1, thread._pipeline_banks))]
     thread._landing_stream = thread._landing_streams[0]
     thread._pipeline_landing_enabled = os.getenv("VLLM_ASCEND_DSA_PD_MOONCAKE_PIPELINE", "0") == "1"
     thread.vllm_config = SimpleNamespace()

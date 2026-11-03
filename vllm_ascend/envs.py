@@ -96,9 +96,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # pipeline on or off. BANKS=1 degenerates to per-window landing waits.
     # 0 keeps the legacy synchronous landing path (kill switch). Valid
     # values: 0 or 1. Not sensitive.
-    "VLLM_ASCEND_DSA_PD_MOONCAKE_PIPELINE": lambda: _strict_binary_env(
-        "VLLM_ASCEND_DSA_PD_MOONCAKE_PIPELINE"
-    ),
+    "VLLM_ASCEND_DSA_PD_MOONCAKE_PIPELINE": lambda: _strict_binary_env("VLLM_ASCEND_DSA_PD_MOONCAKE_PIPELINE"),
     # Number of staging banks (and landing streams) used by the pipeline mode
     # above. The window is split into this many banks that consecutive reads
     # round-robin between; each bank's copies land on its own stream. Default
@@ -108,18 +106,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # tail-intolerant SLOs at the cost of smaller network batches (window/K
     # chunks per engine call). Any value >= 1 works; banks larger than the
     # window are clamped. This setting is not sensitive.
-    "VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS": lambda: max(
-        1, int(os.getenv("VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS", "4"))
-    ),
+    "VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS": lambda: max(1, int(os.getenv("VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS", "4"))),
     # Opt-in probe for the staged-read timing blind spot: after each engine
     # batch read returns, a device-wide torch.npu.synchronize() reveals how
     # much later the network data actually becomes visible on the device
     # (read_settle_s in the receive timing line). 0 = off. Measurement runs
     # only - the device-wide sync defeats the pipelining. Valid values: 0 or
     # 1. Not sensitive.
-    "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE": lambda: _strict_binary_env(
-        "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE"
-    ),
+    "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE": lambda: _strict_binary_env("VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE"),
 }
 
 # end-env-vars-definition

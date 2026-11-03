@@ -50,6 +50,7 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
+from vllm_ascend.utils import vllm_version_is
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 
@@ -88,12 +89,21 @@ def _pack_conv_weights(conv1d: nn.Module) -> None:
         .to(device=packed_param.device, dtype=packed_param.dtype)
         .contiguous()
     )
-    replace_parameter(
-        conv1d,
-        _PACKED_CONV_WEIGHT_NAME,
-        packed_weight,
-        prefer_copy=True,
-    )
+    # vLLM main (#62326) keeps the parameter object by default and drops
+    # `prefer_copy`; v0.32.0 still requires `prefer_copy=True`.
+    if vllm_version_is("0.32.0"):
+        replace_parameter(
+            conv1d,
+            _PACKED_CONV_WEIGHT_NAME,
+            packed_weight,
+            prefer_copy=True,
+        )
+    else:
+        replace_parameter(
+            conv1d,
+            _PACKED_CONV_WEIGHT_NAME,
+            packed_weight,
+        )
 
 
 def initialize_packed_conv_weight(layer: nn.Module) -> None:
@@ -844,24 +854,38 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     last_recurrent_state,
                 )
             else:
-                initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
-                clear_ssm_states(initial_state, prefill_has_initial_state)
+                # Under the hybrid KV-cache manager the state cache is a view
+                # over padded physical pages, so ``ssm_state[indices]`` would
+                # first copy the entire cache on NPU. Gather only the selected
+                # rows there; a packed contiguous cache keeps the plain index.
+                padded_state = ssm_state.stride(0) != ssm_state[0].numel()
+                if padded_state:
+                    initial_state = gather_ssm_states(
+                        ssm_state,
+                        prefill_state_indices,
+                        prefill_has_initial_state,
+                    )
+                else:
+                    initial_state = ssm_state[prefill_state_indices]
+                    clear_ssm_states(initial_state, prefill_has_initial_state)
                 (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
                     g=g_non_spec,
                     beta=beta_non_spec,
-                    initial_state=initial_state,
+                    initial_state=initial_state.transpose(-1, -2).contiguous(),
                     output_final_state=True,
                     cu_seqlens=prefill_query_start_loc,
                     prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
-                ssm_state[prefill_state_indices] = (
-                    last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
-                )
+                final_state = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+                if padded_state:
+                    scatter_ssm_states_(ssm_state, prefill_state_indices, final_state)
+                else:
+                    ssm_state[prefill_state_indices] = final_state
             if split_non_spec:
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec],

@@ -83,7 +83,6 @@ from vllm_ascend.utils import (
     get_kv_cache_tensor_layers,
     npu_stream_switch,
     trans_nd_to_nz,
-    vllm_version_is,
 )
 
 # isort: off
@@ -583,9 +582,7 @@ class KVCacheSendingLayerThread(threading.Thread):
     ) -> None:
         deadline = time.monotonic() + self.timeout
         while True:
-            response = self._send_staging_owner_msg(
-                control_host, control_port, STAGING_ACQUIRE_MSG, owner_id
-            )
+            response = self._send_staging_owner_msg(control_host, control_port, STAGING_ACQUIRE_MSG, owner_id)
             if response == b"ACK":
                 return
             if response != STAGING_BUSY:
@@ -601,9 +598,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         control_port: int | None,
         owner_id: str,
     ) -> None:
-        response = self._send_staging_owner_msg(
-            control_host, control_port, STAGING_RELEASE_MSG, owner_id
-        )
+        response = self._send_staging_owner_msg(control_host, control_port, STAGING_RELEASE_MSG, owner_id)
         if response != b"ACK":
             raise RuntimeError(f"Failed to release layerwise staging ownership: owner={owner_id} response={response}")
 
@@ -690,8 +685,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             or transfer_meta.control_port is None
         ):
             logger.error(
-                "Layerwise offloaded KV transfer requires complete remote staging metadata. "
-                "session_id=%s req_ids=%s",
+                "Layerwise offloaded KV transfer requires complete remote staging metadata. session_id=%s req_ids=%s",
                 session_id,
                 transfer_meta.req_ids,
             )
@@ -701,13 +695,9 @@ class KVCacheSendingLayerThread(threading.Thread):
         acquired = False
         result = -1
         try:
-            self._acquire_staging_ownership(
-                transfer_meta.control_host, transfer_meta.control_port, owner_id
-            )
+            self._acquire_staging_ownership(transfer_meta.control_host, transfer_meta.control_port, owner_id)
             acquired = True
-            result = self._batch_transfer_sync_write_with_optional_staging_owned(
-                session_id, transfer_meta, owner_id
-            )
+            result = self._batch_transfer_sync_write_with_optional_staging_owned(session_id, transfer_meta, owner_id)
         except Exception as e:
             logger.error(
                 "Layerwise staging ownership failed. session_id=%s req_ids=%s owner=%s error=%s",
@@ -719,13 +709,10 @@ class KVCacheSendingLayerThread(threading.Thread):
         finally:
             if acquired:
                 try:
-                    self._release_staging_ownership(
-                        transfer_meta.control_host, transfer_meta.control_port, owner_id
-                    )
+                    self._release_staging_ownership(transfer_meta.control_host, transfer_meta.control_port, owner_id)
                 except Exception as e:
                     logger.error(
-                        "Failed to release layerwise staging ownership. "
-                        "session_id=%s req_ids=%s owner=%s error=%s",
+                        "Failed to release layerwise staging ownership. session_id=%s req_ids=%s owner=%s error=%s",
                         session_id,
                         transfer_meta.req_ids,
                         owner_id,
@@ -1232,17 +1219,11 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_scheduler = None
             self.connector_worker = MooncakeLayerwiseConnectorWorker(vllm_config, kv_cache_config, str(self.engine_id))
 
-    ############################################################
-    # Scheduler Side Methods
-    ############################################################
-
-    if not vllm_version_is("0.31.0"):
-
-        def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
-            # vLLM main's scheduler uses this for skip_zeroing_group_ids and for
-            # the DSV4.1 SWA replay-window check; a P/D transfer restores the
-            # request's own blocks, i.e. every transfer group.
-            return self._kv_cache_config.transfer_group_ids
+    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+        # vLLM main's scheduler uses this for skip_zeroing_group_ids and for
+        # the DSV4.1 SWA replay-window check; a P/D transfer restores the
+        # request's own blocks, i.e. every transfer group.
+        return self._kv_cache_config.transfer_group_ids
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
@@ -2381,9 +2362,7 @@ class MooncakeLayerwiseConnectorWorker:
             self._align_remote_block_ids(req_meta)
             for i, kv_cache_spec in enumerate(self.kv_cache_specs):
                 if isinstance(kv_cache_spec, MambaSpec):
-                    single_group_transfer_mappings = self._get_kv_split_metadata_for_mamba(
-                        req_meta, req_idx, req_id, i
-                    )
+                    single_group_transfer_mappings = self._get_kv_split_metadata_for_mamba(req_meta, req_idx, req_id, i)
                 else:
                     single_group_transfer_mappings = self._get_kv_split_metadata(req_meta, req_idx, req_id, i)
                 for (host, port), block_dict in single_group_transfer_mappings.items():
@@ -2399,9 +2378,9 @@ class MooncakeLayerwiseConnectorWorker:
                     transfer_mappings[(host, port)]["remote_block_ids"][i].extend(
                         single_group_transfer_mappings[(host, port)]["remote_block_ids"]
                     )
-                    transfer_mappings[(host, port)]["trans_count"][i] = single_group_transfer_mappings[
-                        (host, port)
-                    ]["trans_count"]
+                    transfer_mappings[(host, port)]["trans_count"][i] = single_group_transfer_mappings[(host, port)][
+                        "trans_count"
+                    ]
             assert len(transfer_mappings) <= 1, f"Not support add mutil transfer task for req_id:{req_id}"
             update_req_meta = copy.deepcopy(req_meta)
             for (host, port), block_dict in transfer_mappings.items():

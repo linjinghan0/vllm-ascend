@@ -42,6 +42,10 @@ def make_speculator():
         hf_config=SimpleNamespace(target_layer_ids=[0, 2], target_hidden_size=4, num_target_layers=2)
     )
     spec.vllm_config.speculative_config = SimpleNamespace(draft_model_config=spec.draft_model_config)
+    # vLLM main (#62326) reads these overrides from the speculator's own config.
+    spec.speculative_config = SimpleNamespace(  # type: ignore[assignment]
+        moe_backend=None, attention_backend=None, kv_cache_dtype=None
+    )
     spec.num_query_per_req = 5
     spec.input_buffers = SimpleNamespace(
         positions=torch.arange(20), seq_lens=torch.tensor([5, 0, 0, 0], dtype=torch.int32)
@@ -70,12 +74,22 @@ def test_dspark_sync_matches_global_draft_requests(monkeypatch, replicated_pcp):
 
     if not replicated_pcp:
         # The helper replaces the real DP state after checking capacity.
-        target_sync = DPSyncState(
-            num_tokens_across_dp=torch.tensor([4, 4]), uniform_token_count=1, eager=False, num_reqs=4
-        )
+        if vllm_version_is("0.32.0"):
+            target_sync = DPSyncState(  # type: ignore[call-arg]
+                num_tokens_across_dp=torch.tensor([4, 4]), uniform_token_count=1, eager=False, num_reqs=4
+            )
+        else:
+            # Main adds the agreed query-length bound for varlen decode graphs.
+            target_sync = DPSyncState(  # type: ignore[call-arg]
+                num_tokens_across_dp=torch.tensor([4, 4]),
+                uniform_token_count=1,
+                max_query_len=None,
+                eager=False,
+                num_reqs=4,
+            )
     monkeypatch.setattr(DSparkSpeculator, "propose", parent_propose)
     # vLLM #60754 renamed `dp_sync` -> `dp_sync_state` on main.
-    dp_sync_kwarg = "dp_sync" if vllm_version_is("0.31.0") else "dp_sync_state"
+    dp_sync_kwarg = "dp_sync_state"
     assert spec.propose(batch, *[None for _ in range(10)], **{dp_sync_kwarg: target_sync}) == "draft"
 
 
@@ -273,10 +287,12 @@ def test_capture_delegates_and_restores_contexts(monkeypatch, architecture, fail
         object(),
         128,
     )
-    args = (*forward_args, False, "capture")
+    # vLLM main renamed the hook to
+    # ``prepare_forward(num_reqs, attn_metadata)``.
+    args = (*forward_args, False, None, "capture")
     expected_kwargs = {
         "causal": False,
-        "precompute_context_kv": "capture",
+        "prepare_forward": "capture",
         "progress_bar_desc": "Capturing CUDA graphs",
     }
 

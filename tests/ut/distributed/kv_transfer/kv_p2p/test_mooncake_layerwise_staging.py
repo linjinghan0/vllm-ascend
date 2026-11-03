@@ -17,17 +17,16 @@ import msgspec
 import torch
 import zmq
 
+import vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector as mlc
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-    KVCacheRecvingLayerThread,
-    KVCacheSendingLayerThread,
-    MooncakeAgentMetadata,
     STAGING_ACQUIRE_MSG,
     STAGING_BUSY,
     STAGING_COPY_MSG,
     STAGING_RELEASE_MSG,
+    KVCacheRecvingLayerThread,
+    KVCacheSendingLayerThread,
+    MooncakeAgentMetadata,
 )
-
-import vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector as mlc
 
 _TEST_PORT_BASE = 21783
 _port_counter = 0
@@ -55,8 +54,9 @@ def _make_recv_thread(
         ready_event=ready_event,
         staging_tensor=staging_tensor,
     )
-    with patch.object(mlc, "get_transfer_timeout_value", return_value=lease_timeout), patch.object(
-        mlc, "get_ip", return_value="127.0.0.1"
+    with (
+        patch.object(mlc, "get_transfer_timeout_value", return_value=lease_timeout),
+        patch.object(mlc, "get_ip", return_value="127.0.0.1"),
     ):
         # __init__ already consumed get_ip; re-point the host for run().
         thread.side_channel_host = "127.0.0.1"
@@ -158,10 +158,11 @@ class TestStagingOwnershipLease(unittest.TestCase):
         def fake_resolve(dst, length):
             return (fake_target, 0)
 
-        with patch.object(mlc, "get_world_group", return_value=types.SimpleNamespace(local_rank=0)), patch.object(
-            torch.npu, "set_device", lambda device: None
-        ), patch.object(torch.npu, "synchronize", lambda *a, **k: None), patch.object(
-            mlc, "get_dsa_pd_mooncake_offloaded_kv_tensor", side_effect=fake_resolve
+        with (
+            patch.object(mlc, "get_world_group", return_value=types.SimpleNamespace(local_rank=0)),
+            patch.object(torch.npu, "set_device", lambda device: None),
+            patch.object(torch.npu, "synchronize", lambda *a, **k: None),
+            patch.object(mlc, "get_dsa_pd_mooncake_offloaded_kv_tensor", side_effect=fake_resolve),
         ):
             self.assertEqual(client.copy(["req-2"], [[0, 16, 100]], "owner-A"), b"ACK")
 
@@ -179,10 +180,10 @@ class TestStagingOwnershipLease(unittest.TestCase):
         thread = self.port_holder[-1]
         self.assertEqual(client.acquire("owner-A"), b"ACK")
 
-        with patch.object(mlc, "get_world_group", return_value=types.SimpleNamespace(local_rank=0)), patch.object(
-            torch.npu, "set_device", lambda device: None
-        ), patch.object(
-            mlc, "get_dsa_pd_mooncake_offloaded_kv_tensor", return_value=None
+        with (
+            patch.object(mlc, "get_world_group", return_value=types.SimpleNamespace(local_rank=0)),
+            patch.object(torch.npu, "set_device", lambda device: None),
+            patch.object(mlc, "get_dsa_pd_mooncake_offloaded_kv_tensor", return_value=None),
         ):
             self.assertEqual(client.copy(["req-3"], [[0, 16, 0]], "owner-A"), b"FAILED")
 

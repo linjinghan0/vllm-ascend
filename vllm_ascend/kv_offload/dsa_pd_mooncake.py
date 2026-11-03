@@ -23,9 +23,7 @@ class _DSAPDMooncakeKVRegistry:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._cpu_buffers: list[tuple[int, int]] = []
-        self._offloaded_tensors: list[
-            tuple[int, int, weakref.ReferenceType[torch.Tensor]]
-        ] = []
+        self._offloaded_tensors: list[tuple[int, int, weakref.ReferenceType[torch.Tensor]]] = []
 
     def register_cpu_buffer(self, ptr: int, size: int) -> None:
         if ptr <= 0 or size <= 0:
@@ -49,9 +47,7 @@ class _DSAPDMooncakeKVRegistry:
                 if existing is None:
                     continue
                 live_entries.append((start, length, tensor_ref))
-                already_registered = already_registered or (
-                    start == ptr and length == size
-                )
+                already_registered = already_registered or (start == ptr and length == size)
             if not already_registered:
                 live_entries.append((ptr, size, weakref.ref(tensor)))
             self._offloaded_tensors = live_entries
@@ -104,7 +100,6 @@ def register_dsa_pd_mooncake_offloaded_kv_tensor(tensor: torch.Tensor) -> None:
     _DSA_PD_MOONCAKE_KV_REGISTRY.register_offloaded_tensor(tensor)
 
 
-
 def reset_dsa_pd_mooncake_kv_registries() -> None:
     _DSA_PD_MOONCAKE_KV_REGISTRY.clear()
 
@@ -126,6 +121,7 @@ def get_dsa_pd_mooncake_offloaded_kv_tensor(
 
 def is_dsa_pd_mooncake_offloaded_kv_buffer(ptr: int, size: int) -> bool:
     return get_dsa_pd_mooncake_offloaded_kv_tensor(ptr, size) is not None
+
 
 def _iter_connector_names(kv_transfer_config: Any) -> list[str]:
     connector_names: list[str] = []
@@ -192,9 +188,7 @@ def should_use_dsa_pd_mooncake_long_context_kv(vllm_config: Any) -> bool:
         vllm_config,
         use_sparse=_is_dsa_sparse_model(vllm_config),
         is_kv_consumer=_is_mooncake_kv_consumer(vllm_config),
-        enable_cpu_kv_store=bool(
-            _config_get(dsa_sparse_attention_config, "enable_cpu_kv_store", False)
-        ),
+        enable_cpu_kv_store=bool(_config_get(dsa_sparse_attention_config, "enable_cpu_kv_store", False)),
         dsa_sparse_attention_mode=_config_get(dsa_sparse_attention_config, "mode", None),
     )
 
