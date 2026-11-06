@@ -6,3 +6,5 @@ entries:
       Unsupported Host KV layouts now fail explicitly instead of silently using device KV.
   - category: performance
     text: Reused the request staging buffer for DSA Host KV landing without repeating capacity checks for each copy.
+  - category: performance
+    text: Cached DSA Host KV byte views with lifecycle-aware invalidation to avoid rebuilding them for every landing copy.

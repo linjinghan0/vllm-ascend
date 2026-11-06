@@ -2,7 +2,9 @@
 """CPU regressions for V2 routing and the shared DSA landing lifecycle."""
 
 import ctypes
+import gc
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -248,3 +250,23 @@ def test_receive_reuses_staging_for_every_landing(pipeline):
     assert reader.batch_transfer_sync_read("peer", [target.data_ptr()], [10 * chunk], [target.nbytes], "request") == 0
     reader._ensure_dsa_pd_mooncake_staging_tensor.assert_called_once()
     assert torch.all(target == 7)
+
+
+def test_registry_byte_view_aliases_storage_and_expires_with_kv_tensor():
+    local_registry = registry._DSAPDMooncakeKVRegistry()
+    target = torch.zeros(32, dtype=torch.int16)
+    local_registry.register_offloaded_tensor(target)
+    first, offset = local_registry.resolve_offloaded_byte_tensor(target.data_ptr() + 4, 8)
+    second, _ = local_registry.resolve_offloaded_byte_tensor(target.data_ptr(), target.nbytes)
+    assert first is second and offset == 4
+    first.fill_(1)
+    assert torch.all(target == 257)
+    local_registry.clear()
+    assert local_registry.resolve_offloaded_byte_tensor(target.data_ptr(), target.nbytes) is None
+    local_registry.register_offloaded_tensor(target)
+    renewed, _ = local_registry.resolve_offloaded_byte_tensor(target.data_ptr(), target.nbytes)
+    assert renewed is not first
+    target_ref, view_ref = weakref.ref(target), weakref.ref(renewed)
+    del first, second, renewed, target
+    gc.collect()
+    assert target_ref() is None and view_ref() is None

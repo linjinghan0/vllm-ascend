@@ -12,6 +12,7 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.kv_offload.dsa_pd_mooncake import (
     get_dsa_pd_mooncake_kv_register_location,
+    get_dsa_pd_mooncake_offloaded_kv_byte_tensor,
     get_dsa_pd_mooncake_offloaded_kv_tensor,
 )
 
@@ -97,13 +98,12 @@ class DSAPDMooncakeStagingMixin:
     def _copy_dsa_pd_mooncake_staging_to_offloaded_kv(
         self, dst: int, length: int, staging_offset: int = 0, *, staging: torch.Tensor | None = None
     ) -> None:
-        resolved = get_dsa_pd_mooncake_offloaded_kv_tensor(dst, length)
+        resolved = get_dsa_pd_mooncake_offloaded_kv_byte_tensor(dst, length)
         if resolved is None:
             raise RuntimeError(f"Missing DSA PD Mooncake offloaded KV tensor for dst={dst} length={length}.")
-        target_tensor, offset = resolved
+        target_bytes, offset = resolved
         if staging is None:
             staging = self._ensure_dsa_pd_mooncake_staging_tensor()
-        target_bytes = target_tensor.view(torch.int8).reshape(-1)
         target_bytes.narrow(0, offset, length).copy_(
             staging[staging_offset : staging_offset + length], non_blocking=False
         )
