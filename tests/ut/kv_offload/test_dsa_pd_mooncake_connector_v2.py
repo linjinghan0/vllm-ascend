@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
-
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import base_worker, pull_worker
 from vllm_ascend.kv_offload import dsa_pd_mooncake as registry
 from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
@@ -163,7 +162,7 @@ def test_peer_bucket_cannot_overwrite_staging_during_landing():
     release_landing = threading.Event()
     second_started = threading.Event()
 
-    def land(*args):
+    def land(*args, **kwargs):
         landing_entered.set()
         assert release_landing.wait(5)
 
@@ -229,3 +228,23 @@ def test_host_only_v2_consumer_preregisters_staging_before_receiver_start(monkey
     monkeypatch.setattr(pull_worker, "MooncakePullRecvingThread", receiver)
     worker.register_kv_caches({"model.layers.0.self_attn": host})
     assert order == ["staging_registered", "receiver_created"]
+
+
+@pytest.mark.parametrize("pipeline", [False, True])
+def test_receive_reuses_staging_for_every_landing(pipeline):
+    chunk = 2 * 1024 * 1024
+    target = torch.zeros(3 * chunk, dtype=torch.int8)
+    registry.register_dsa_pd_mooncake_offloaded_kv_tensor(target)
+    engine = MagicMock()
+    reader = make_reader(engine, pipeline=pipeline, window=2 if pipeline else 1)
+    reader._ensure_dsa_pd_mooncake_staging_tensor = MagicMock(wraps=reader._ensure_dsa_pd_mooncake_staging_tensor)
+
+    def read(_session, local, _remote, lengths):
+        for dst, length in zip(local, lengths):
+            ctypes.memset(dst, 7, length)
+        return 0
+
+    engine.batch_transfer_sync_read.side_effect = read
+    assert reader.batch_transfer_sync_read("peer", [target.data_ptr()], [10 * chunk], [target.nbytes], "request") == 0
+    reader._ensure_dsa_pd_mooncake_staging_tensor.assert_called_once()
+    assert torch.all(target == 7)

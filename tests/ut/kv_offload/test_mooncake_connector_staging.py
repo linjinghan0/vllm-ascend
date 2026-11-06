@@ -15,7 +15,6 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
     KVCacheRecvingThread,
 )
@@ -62,7 +61,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         self.thread._get_dsa_pd_mooncake_staging_chunk_bytes = lambda: self.staging_chunk_bytes
         self.thread._get_dsa_pd_mooncake_staging_window = lambda: 1
 
-        def record_copy(dst: int, length: int, staging_offset: int = 0) -> None:
+        def record_copy(dst: int, length: int, staging_offset: int = 0, **_prepared: object) -> None:
             copied.append((dst, length, staging_offset))
 
         self.thread._copy_dsa_pd_mooncake_staging_to_offloaded_kv = record_copy
@@ -312,7 +311,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         self.thread._landing_streams = [self.thread._landing_stream]
         self.thread.engine.batch_transfer_sync_read.return_value = 0
 
-        def record_copy(dst: int, length: int, staging_offset: int = 0) -> None:
+        def record_copy(dst: int, length: int, staging_offset: int = 0, **_prepared: object) -> None:
             copied.append((dst, length, staging_offset))
 
         self.thread._copy_dsa_pd_mooncake_staging_to_offloaded_kv = record_copy
@@ -401,7 +400,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
 
         copied: list[tuple[int, int, int]] = []
 
-        def record_copy(dst: int, length: int, staging_offset: int = 0) -> None:
+        def record_copy(dst: int, length: int, staging_offset: int = 0, **_prepared: object) -> None:
             copied.append((dst, length, staging_offset))
 
         self.thread._copy_dsa_pd_mooncake_staging_to_offloaded_kv = record_copy
