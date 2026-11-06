@@ -8,3 +8,5 @@ entries:
     text: Reused the request staging buffer for DSA Host KV landing without repeating capacity checks for each copy.
   - category: performance
     text: Cached DSA Host KV byte views with lifecycle-aware invalidation to avoid rebuilding them for every landing copy.
+  - category: performance
+    text: Reused the resolved Host KV target and byte offset from each receive plan during DSA landing.
