@@ -14,3 +14,7 @@ entries:
     text: Indexed DSA Mooncake buffer ranges to avoid rebuilding and scanning the registry on every address lookup.
   - category: performance
     text: Carried local KV destination metadata through Mooncake V2 receive plans to avoid rediscovering each address classification.
+  - category: performance
+    text: >-
+      Reused bounded zero-copy staging slices and repeated Host KV destination slices
+      to reduce DSA Mooncake landing metadata construction.

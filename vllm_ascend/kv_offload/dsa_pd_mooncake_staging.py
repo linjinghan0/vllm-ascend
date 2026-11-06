@@ -3,6 +3,8 @@
 
 import threading
 import time
+import weakref
+from collections import OrderedDict
 from collections.abc import Iterator
 from typing import Any
 
@@ -20,6 +22,59 @@ from vllm_ascend.kv_offload.dsa_pd_mooncake import (
     prepare_dsa_pd_mooncake_transfer_targets,
 )
 
+_DSA_PD_MOONCAKE_LANDING_VIEW_CACHE_SIZE = 256
+
+
+class _DSAPDMooncakeLandingViews:
+    """Bound reusable byte views without owning their source Tensor objects.
+
+    The staging request lock serializes callers. Source slices repeat within a
+    receive; destination slices are admitted only after a second access, so a
+    one-off destination needs no detach. Cached slices are detached so
+    their base Tensor can die and clear its entries, while writes still alias
+    the original storage. Registry byte views and staging layouts are immutable
+    for their Tensor lifetime; a replacement Tensor gets distinct entries.
+    """
+
+    def __init__(self, capacity: int = _DSA_PD_MOONCAKE_LANDING_VIEW_CACHE_SIZE) -> None:
+        if capacity < 1:
+            raise ValueError("Landing view cache capacity must be positive.")
+        self.capacity = capacity
+        self._views: OrderedDict[
+            tuple[int, int, int, bool], tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor]
+        ] = OrderedDict()
+        self._recent: OrderedDict[tuple[int, int, int, bool], weakref.ReferenceType[torch.Tensor]] = OrderedDict()
+
+    def get(self, tensor: torch.Tensor, offset: int, length: int, *, source: bool = False) -> torch.Tensor:
+        key = (id(tensor), offset, length, source)
+        entry = self._views.get(key)
+        if entry is not None and entry[0]() is tensor:
+            self._views.move_to_end(key)
+            return entry[1]
+
+        view = tensor[offset : offset + length] if source else tensor.narrow(0, offset, length)
+        if not source:
+            previous = self._recent.pop(key, None)
+            if previous is None or previous() is not tensor:
+                self._recent[key] = weakref.ref(tensor)
+                if len(self._recent) > self.capacity:
+                    self._recent.popitem(last=False)
+                return view
+        view = view.detach()
+        cache_ref = weakref.ref(self)
+
+        def release(tensor_ref: weakref.ReferenceType[torch.Tensor]) -> None:
+            cache = cache_ref()
+            if cache is not None:
+                cached = cache._views.get(key)
+                if cached is not None and cached[0] is tensor_ref:
+                    cache._views.pop(key, None)
+
+        self._views[key] = (weakref.ref(tensor, release), view)
+        if len(self._views) > self.capacity:
+            self._views.popitem(last=False)
+        return view
+
 
 class DSAPDMooncakeStagingMixin:
     """Own a bounded staging window until every Host KV copy has landed."""
@@ -33,6 +88,7 @@ class DSAPDMooncakeStagingMixin:
         self._dsa_pd_mooncake_staging_tensor: torch.Tensor | None = None
         self._dsa_pd_mooncake_staging_bytes = 0
         self._dsa_pd_mooncake_staging_lock = threading.Lock()
+        self._dsa_pd_mooncake_landing_views = _DSAPDMooncakeLandingViews()
         self._pipeline_banks = ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS
         self._landing_streams = [torch.npu.Stream() for _ in range(max(1, self._pipeline_banks))]
         self._landing_stream = self._landing_streams[0]
@@ -116,8 +172,13 @@ class DSAPDMooncakeStagingMixin:
             target_bytes, target_offset = resolved
         if staging is None:
             staging = self._ensure_dsa_pd_mooncake_staging_tensor()
-        target_bytes.narrow(0, target_offset, length).copy_(
-            staging[staging_offset : staging_offset + length], non_blocking=False
+        views = getattr(self, "_dsa_pd_mooncake_landing_views", None)
+        if views is None:
+            # Keep compatibility with readers constructed without _init in
+            # connector integrations and CPU regression fixtures.
+            views = self._dsa_pd_mooncake_landing_views = _DSAPDMooncakeLandingViews()
+        views.get(target_bytes, target_offset, length).copy_(
+            views.get(staging, staging_offset, length, source=True), non_blocking=False
         )
 
     @staticmethod
