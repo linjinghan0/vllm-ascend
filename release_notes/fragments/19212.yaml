@@ -18,3 +18,7 @@ entries:
     text: >-
       Reused bounded zero-copy staging slices and repeated Host KV destination slices
       to reduce DSA Mooncake landing metadata construction.
+  - category: performance
+    text: >-
+      Reduced CPU work for Mooncake V2 transfer address lists with a single-group
+      fast path and bulk construction for fragmented requests.

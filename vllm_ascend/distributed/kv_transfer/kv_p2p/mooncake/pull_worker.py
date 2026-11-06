@@ -54,6 +54,27 @@ from vllm_ascend.kv_offload.dsa_pd_mooncake import (
 )
 from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
 
+_BULK_TRANSFER_ADDRESS_GROUPS = 32
+
+
+def _build_block_transfer_addresses(
+    local_block_groups: list[list[int]],
+    remote_block_groups: list[list[int]],
+    local_base_addr: int,
+    remote_base_addr: int,
+    local_block_stride: int,
+    remote_block_stride: int,
+    transfer_len: int,
+    local_inner_offset: int,
+    remote_inner_offset: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Build fragmented address columns without closure setup on scalar calls."""
+    return (
+        [local_base_addr + group[0] * local_block_stride + local_inner_offset for group in local_block_groups],
+        [remote_base_addr + group[0] * remote_block_stride + remote_inner_offset for group in remote_block_groups],
+        [transfer_len * len(group) for group in local_block_groups],
+    )
+
 
 class MooncakePullRecvingThread(threading.Thread):
     """D-side execution thread for Mooncake pull requests.
@@ -1145,6 +1166,38 @@ class MooncakePullRecvingThread(threading.Thread):
     ) -> None:
         """Append addresses from block groups prepared for one request."""
         if transfer_len <= 0:
+            return
+        group_count = len(local_block_groups)
+        if group_count == 1 and len(remote_block_groups) == 1:
+            local_block_group, remote_block_group = local_block_groups[0], remote_block_groups[0]
+            src_list.append(local_base_addr + local_block_group[0] * local_block_stride + local_inner_offset)
+            dst_list.append(remote_base_addr + remote_block_group[0] * remote_block_stride + remote_inner_offset)
+            length_list.append(transfer_len * len(local_block_group))
+            if transfer_targets is not None:
+                assert local_target is not None
+                transfer_targets.append(local_target)
+            return
+        if group_count >= _BULK_TRANSFER_ADDRESS_GROUPS and group_count == len(remote_block_groups):
+            # Keep Python integers and list-based native binding inputs.
+            # Short lists stay scalar; fragmented requests amortize append
+            # dispatch using one extend per output column.
+            src, dst, lengths = _build_block_transfer_addresses(
+                local_block_groups,
+                remote_block_groups,
+                local_base_addr,
+                remote_base_addr,
+                local_block_stride,
+                remote_block_stride,
+                transfer_len,
+                local_inner_offset,
+                remote_inner_offset,
+            )
+            src_list.extend(src)
+            dst_list.extend(dst)
+            length_list.extend(lengths)
+            if transfer_targets is not None:
+                assert local_target is not None
+                transfer_targets.extend([local_target] * group_count)
             return
         for local_block_group, remote_block_group in zip(local_block_groups, remote_block_groups):
             src_list.append(local_base_addr + local_block_group[0] * local_block_stride + local_inner_offset)
