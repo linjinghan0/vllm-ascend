@@ -78,6 +78,10 @@ def consumer(args: argparse.Namespace, engine: Any) -> None:
     thread.layer_names = ["model.layers.0.self_attn", "model.layers.1.self_attn"]
     thread.kv_cache_specs = [FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16)]
     thread.kv_caches_base_addr = [[host.data_ptr()], [hbm.data_ptr()]]
+    reader.kv_caches = dict(zip(thread.layer_names, (host, hbm)))
+    thread._transfer_targets = reader.get_transfer_targets(thread.layer_names, thread.kv_caches_base_addr)
+    assert thread._transfer_targets is not None
+    assert thread._transfer_targets[0][0].offloaded and not thread._transfer_targets[1][0].offloaded
     thread.block_strides = thread.block_lens = [[block], [block]]
     thread.block_shapes = [[(1, 16, 8)], [(1, 16, 8)]]
     thread.block_size_scales = [[1], [1]]
@@ -144,6 +148,7 @@ def consumer(args: argparse.Namespace, engine: Any) -> None:
         "role": "consumer",
         "connector": "MooncakeConnectorV2",
         "allocator": "ModelRunnerV2 DSA Host KV",
+        "target_metadata": thread._transfer_targets is not None,
         "host_ok": host_ok,
         "hbm_ok": hbm_ok,
         "host_bytes": host.nbytes,

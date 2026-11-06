@@ -48,7 +48,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     group_concurrent_contiguous,
     zmq_ctx,
 )
-from vllm_ascend.kv_offload.dsa_pd_mooncake import is_dsa_pd_mooncake_offloaded_kv_buffer
+from vllm_ascend.kv_offload.dsa_pd_mooncake import (
+    DSAPDMooncakeTransferTarget,
+    is_dsa_pd_mooncake_offloaded_kv_buffer,
+)
 from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
 
 
@@ -104,6 +107,11 @@ class MooncakePullRecvingThread(threading.Thread):
         self.block_lens = local_metadata.block_lens
         self.block_shapes = local_metadata.block_shapes
         self.block_size_scales = local_metadata.block_size_scales
+        self._transfer_targets = (
+            staging_reader.get_transfer_targets(self.layer_names, self.kv_caches_base_addr)
+            if staging_reader is not None
+            else None
+        )
 
         self.use_mla = self.model_config.is_deepseek_mla
         hf_text_config = self.model_config.hf_text_config
@@ -1132,6 +1140,8 @@ class MooncakePullRecvingThread(threading.Thread):
         length_list: list[int],
         local_inner_offset: int = 0,
         remote_inner_offset: int = 0,
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = None,
+        local_target: DSAPDMooncakeTransferTarget | None = None,
     ) -> None:
         """Append addresses from block groups prepared for one request."""
         if transfer_len <= 0:
@@ -1140,6 +1150,9 @@ class MooncakePullRecvingThread(threading.Thread):
             src_list.append(local_base_addr + local_block_group[0] * local_block_stride + local_inner_offset)
             dst_list.append(remote_base_addr + remote_block_group[0] * remote_block_stride + remote_inner_offset)
             length_list.append(transfer_len * len(local_block_group))
+            if transfer_targets is not None:
+                assert local_target is not None
+                transfer_targets.append(local_target)
 
     def _append_spec_transfer_addresses(
         self,
@@ -1154,6 +1167,7 @@ class MooncakePullRecvingThread(threading.Thread):
         src_list: list[int],
         dst_list: list[int],
         length_list: list[int],
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = None,
     ) -> None:
         """Append all layers and requests belonging to one local spec."""
         spec = self.kv_cache_specs[spec_index]
@@ -1253,6 +1267,14 @@ class MooncakePullRecvingThread(threading.Thread):
                             src_list=src_list,
                             dst_list=dst_list,
                             length_list=length_list,
+                            **(
+                                {
+                                    "transfer_targets": transfer_targets,
+                                    "local_target": self._transfer_targets[local_layer_index][cache_index],
+                                }
+                                if transfer_targets is not None
+                                else {}
+                            ),
                         )
             return
 
@@ -1380,6 +1402,14 @@ class MooncakePullRecvingThread(threading.Thread):
                         src_list=src_list,
                         dst_list=dst_list,
                         length_list=length_list,
+                        **(
+                            {
+                                "transfer_targets": transfer_targets,
+                                "local_target": self._transfer_targets[local_layer_index][cache_index],
+                            }
+                            if transfer_targets is not None
+                            else {}
+                        ),
                     )
 
     def _execute_tp_transfer_bucket(
@@ -1404,6 +1434,15 @@ class MooncakePullRecvingThread(threading.Thread):
         src_list: list[int] = []
         dst_list: list[int] = []
         length_list: list[int] = []
+        # Preserve local target identities alongside the computed addresses.
+        # Mamba's distinct state-copy layout keeps its existing generic path.
+        transfer_targets = (
+            []
+            if self.staging_reader is not None
+            and getattr(self, "_transfer_targets", None) is not None
+            and not any(isinstance(self.kv_cache_specs[i], MambaSpec) for i in transfer_entries_by_spec)
+            else None
+        )
         for spec_index, transfer_entries_by_layer in transfer_entries_by_spec.items():
             self._append_spec_transfer_addresses(
                 spec_index=spec_index,
@@ -1417,6 +1456,7 @@ class MooncakePullRecvingThread(threading.Thread):
                 src_list=src_list,
                 dst_list=dst_list,
                 length_list=length_list,
+                **({"transfer_targets": transfer_targets} if transfer_targets is not None else {}),
             )
 
         if not src_list:
@@ -1438,7 +1478,12 @@ class MooncakePullRecvingThread(threading.Thread):
             # Success includes landing and event drain, before completion can
             # release the producer's blocks or make Host KV visible to decode.
             ret = self.staging_reader.batch_transfer_sync_read(
-                session_id, src_list, dst_list, length_list, ",".join(request_ids)
+                session_id,
+                src_list,
+                dst_list,
+                length_list,
+                ",".join(request_ids),
+                **({"transfer_targets": transfer_targets} if transfer_targets is not None else {}),
             )
         if ret < 0:
             raise RuntimeError(

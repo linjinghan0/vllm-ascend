@@ -12,9 +12,12 @@ from vllm.logger import logger
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.kv_offload.dsa_pd_mooncake import (
+    DSAPDMooncakeTransferTarget,
+    create_dsa_pd_mooncake_transfer_targets,
     get_dsa_pd_mooncake_kv_register_location,
     get_dsa_pd_mooncake_offloaded_kv_byte_tensor,
     get_dsa_pd_mooncake_offloaded_kv_tensor,
+    prepare_dsa_pd_mooncake_transfer_targets,
 )
 
 
@@ -151,16 +154,24 @@ class DSAPDMooncakeStagingMixin:
         dst_list: list[int],
         length_list: list[int],
         remote_request_id: str,
+        *,
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = None,
     ) -> int:
         if not (len(src_list) == len(dst_list) == len(length_list)):
             raise ValueError("Mooncake READ address and length lists must have equal sizes.")
-        requires_staging = any(
-            get_dsa_pd_mooncake_offloaded_kv_tensor(local_dst, length) is not None
-            for local_dst, length in zip(src_list, length_list)
-        )
+        if transfer_targets is not None:
+            if len(transfer_targets) != len(src_list):
+                raise ValueError("Mooncake transfer target count must match address count.")
+            requires_staging = any(target.offloaded for target in transfer_targets)
+        else:
+            requires_staging = any(
+                get_dsa_pd_mooncake_offloaded_kv_tensor(local_dst, length) is not None
+                for local_dst, length in zip(src_list, length_list)
+            )
+        target_kwargs = {} if transfer_targets is None else {"transfer_targets": transfer_targets}
         if not requires_staging:
             return self._batch_transfer_sync_read_with_optional_staging_unlocked(
-                session_id, src_list, dst_list, length_list, remote_request_id
+                session_id, src_list, dst_list, length_list, remote_request_id, **target_kwargs
             )
 
         # The staging slots are shared by all peer handlers on this worker.
@@ -168,7 +179,7 @@ class DSAPDMooncakeStagingMixin:
         # copy so another request cannot overwrite a slot still being consumed.
         with self._dsa_pd_mooncake_staging_lock:
             return self._batch_transfer_sync_read_with_optional_staging_unlocked(
-                session_id, src_list, dst_list, length_list, remote_request_id
+                session_id, src_list, dst_list, length_list, remote_request_id, **target_kwargs
             )
 
     def _batch_transfer_sync_read_with_optional_staging_unlocked(
@@ -178,7 +189,17 @@ class DSAPDMooncakeStagingMixin:
         dst_list: list[int],
         length_list: list[int],
         remote_request_id: str,
+        *,
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = None,
     ) -> int:
+        # The upstream address builder retains each local KV tensor's identity.
+        # Validate the layout once under the staging lock, then use its targets
+        # directly instead of rediscovering Host/HBM from every destination.
+        resolved_targets = (
+            prepare_dsa_pd_mooncake_transfer_targets(transfer_targets, src_list, length_list)
+            if transfer_targets is not None
+            else None
+        )
         direct_src_list: list[int] = []
         direct_dst_list: list[int] = []
         direct_length_list: list[int] = []
@@ -189,10 +210,14 @@ class DSAPDMooncakeStagingMixin:
         staging_chunk_bytes = self._get_dsa_pd_mooncake_staging_chunk_bytes()
         staging_alignment = 2 * 1024 * 1024
 
-        for local_dst, remote_src, length in zip(src_list, dst_list, length_list):
-            resolved = get_dsa_pd_mooncake_offloaded_kv_byte_tensor(local_dst, length)
+        for position, (local_dst, remote_src, length) in enumerate(zip(src_list, dst_list, length_list)):
+            resolved = (
+                resolved_targets[position]
+                if resolved_targets is not None
+                else get_dsa_pd_mooncake_offloaded_kv_byte_tensor(local_dst, length)
+            )
             if resolved is None:
-                if get_dsa_pd_mooncake_kv_register_location(local_dst, length) == "cpu":
+                if resolved_targets is None and get_dsa_pd_mooncake_kv_register_location(local_dst, length) == "cpu":
                     raise RuntimeError("Missing DSA PD Mooncake offloaded KV tensor for a Host READ destination.")
                 direct_src_list.append(local_dst)
                 direct_dst_list.append(remote_src)
@@ -414,6 +439,20 @@ class DSAPDMooncakeStagingReader(DSAPDMooncakeStagingMixin):
         self.block_len_per_addr = block_len_per_addr
         self._init_dsa_pd_mooncake_staging()
 
+    def get_transfer_targets(
+        self, layer_names: list[str], base_addresses: list[list[int]]
+    ) -> list[list[DSAPDMooncakeTransferTarget]] | None:
+        """Bind local layer/cache metadata once; never serialize these handles."""
+        if len(layer_names) != len(base_addresses):
+            raise ValueError("Mooncake local KV layer names and address metadata differ.")
+        layers = []
+        for layer_name, addresses in zip(layer_names, base_addresses):
+            tensors = list(self._iter_kv_cache_tensors(self.kv_caches[layer_name]))
+            if [int(tensor.data_ptr()) for tensor in tensors] != addresses:
+                raise ValueError("Mooncake local KV tensor identity differs from address metadata.")
+            layers.append(tensors)
+        return create_dsa_pd_mooncake_transfer_targets(layers)
+
     def batch_transfer_sync_read(
         self,
         session_id: str,
@@ -421,7 +460,10 @@ class DSAPDMooncakeStagingReader(DSAPDMooncakeStagingMixin):
         remote_sources: list[int],
         lengths: list[int],
         request_id: str,
+        *,
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = None,
     ) -> int:
+        target_kwargs = {} if transfer_targets is None else {"transfer_targets": transfer_targets}
         return self._batch_transfer_sync_read_with_optional_staging(
-            session_id, local_destinations, remote_sources, lengths, request_id
+            session_id, local_destinations, remote_sources, lengths, request_id, **target_kwargs
         )

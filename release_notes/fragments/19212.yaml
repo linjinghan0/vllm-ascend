@@ -12,3 +12,5 @@ entries:
     text: Reused the resolved Host KV target and byte offset from each receive plan during DSA landing.
   - category: performance
     text: Indexed DSA Mooncake buffer ranges to avoid rebuilding and scanning the registry on every address lookup.
+  - category: performance
+    text: Carried local KV destination metadata through Mooncake V2 receive plans to avoid rediscovering each address classification.
