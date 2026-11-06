@@ -10,3 +10,5 @@ entries:
     text: Cached DSA Host KV byte views with lifecycle-aware invalidation to avoid rebuilding them for every landing copy.
   - category: performance
     text: Reused the resolved Host KV target and byte offset from each receive plan during DSA landing.
+  - category: performance
+    text: Indexed DSA Mooncake buffer ranges to avoid rebuilding and scanning the registry on every address lookup.
