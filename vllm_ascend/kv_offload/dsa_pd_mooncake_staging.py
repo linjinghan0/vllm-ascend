@@ -472,6 +472,10 @@ class DSAPDMooncakeStagingMixin:
         if first_error is not None:
             raise first_error
 
+    def _get_dsa_pd_mooncake_bank_workers(self, banks: tuple[_DSAPDMooncakeStagingBank, ...]) -> int:
+        """Use one worker per effective bank; keep a single bank on the caller."""
+        return len(banks) if len(banks) > 1 else 0
+
     def _execute_dsa_pd_mooncake_bank_workers(
         self,
         session_id: str,
@@ -719,14 +723,12 @@ class DSAPDMooncakeStagingMixin:
             plan = self._prepare_dsa_pd_mooncake_bank_plan(
                 staged_transfers, staged_targets, staging, staging_chunk_bytes, bank_contexts
             )
-            requested_workers = ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS
             if (
-                requested_workers > 0
-                and pipeline_active
+                pipeline_active
                 and not plan.has_cross_bank_overlap
                 and not ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE
             ):
-                workers = min(requested_workers, len(bank_contexts))
+                workers = self._get_dsa_pd_mooncake_bank_workers(bank_contexts)
             if workers:
                 batch_results = self._execute_dsa_pd_mooncake_bank_workers(
                     session_id, plan, bank_contexts, staging, remote_request_id, workers
@@ -736,7 +738,7 @@ class DSAPDMooncakeStagingMixin:
                 # overlapping destinations, and device-wide READ probe runs.
                 def serial_batches() -> Iterator[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]]:
                     for batch in plan.batches:
-                        if requested_workers > 0 and plan.has_cross_bank_overlap:
+                        if plan.has_cross_bank_overlap:
                             # Serial Host submission alone does not order two
                             # streams writing overlapping destination bytes.
                             self._drain_dsa_pd_mooncake_staging_banks(bank_contexts)

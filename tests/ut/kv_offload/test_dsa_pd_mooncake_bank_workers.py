@@ -32,9 +32,11 @@ def reset_registry():
 
 
 class BankRuntime:
-    def __init__(self, monkeypatch, reader, workers, batches):
+    def __init__(self, monkeypatch, reader, workers, batches, banks=BANKS, window=WINDOW):
         self.reader = reader
         self.workers = workers
+        self.banks = banks
+        self.window = window
         self.lock = threading.Lock()
         self.local = threading.local()
         self.threads = set()
@@ -45,8 +47,8 @@ class BankRuntime:
         self.read_hook = None
         self.copy_hook = None
         self.event_hook = None
-        self.barrier = threading.Barrier(min(workers, BANKS, batches)) if workers else None
-        self.queues = [[] for _ in range(BANKS)]
+        self.barrier = threading.Barrier(min(workers, banks, batches)) if workers else None
+        self.queues = [[] for _ in range(banks)]
         self.copy = reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv
         runtime = self
 
@@ -116,7 +118,7 @@ class BankRuntime:
             assert not threading.current_thread().name.startswith("dsa-mooncake-bank")
             return ensure()
 
-        reader._landing_streams = [Stream(index) for index in range(BANKS)]
+        reader._landing_streams = [Stream(index) for index in range(banks)]
         reader._landing_stream = reader._landing_streams[0]
         reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = submit_copy
         reader._execute_dsa_pd_mooncake_bank_batch = owned_execute
@@ -129,7 +131,7 @@ class BankRuntime:
 
     def read(self, session, local, remote, lengths):
         staging_ptr = self.reader._dsa_pd_mooncake_staging_tensor.data_ptr()
-        bank_index = (local[0] - staging_ptr) // (ALIGNMENT * (WINDOW // BANKS))
+        bank_index = (local[0] - staging_ptr) // (ALIGNMENT * (self.window // self.banks))
         with self.lock:
             self.reads.append((session, bank_index, tuple(local), tuple(remote), tuple(lengths)))
             ticket = len(self.reads)
@@ -158,8 +160,7 @@ class BankRuntime:
         assert not self.reader._dsa_pd_mooncake_staging_lock.locked()
 
 
-def build(monkeypatch, workers, count=37, metadata=True):
-    monkeypatch.setitem(envs.env_variables, "VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS", lambda: workers)
+def build(monkeypatch, workers=None, count=37, metadata=True, banks=BANKS, window=WINDOW):
     monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", False)
     storage = torch.empty(ALIGNMENT + count * PIECE_BYTES + 64, dtype=torch.uint8)
     offset = (-storage.data_ptr()) % ALIGNMENT + 64
@@ -167,10 +168,17 @@ def build(monkeypatch, workers, count=37, metadata=True):
     source.copy_((torch.arange(source.numel()) % 251).to(torch.uint8))
     host = torch.zeros(count * HOST_STRIDE, dtype=torch.uint8)
     registry.register_dsa_pd_mooncake_offloaded_kv_tensor(host)
-    reader = make_reader(MagicMock(), pipeline=True, window=WINDOW)
-    reader._pipeline_banks = BANKS
-    batches = (count + WINDOW // BANKS - 1) // (WINDOW // BANKS)
-    runtime = BankRuntime(monkeypatch, reader, min(workers, BANKS), batches)
+    reader = make_reader(MagicMock(), pipeline=True, window=window, bank_workers=workers)
+    reader._pipeline_banks = banks
+    active_banks = min(banks, window) if window >= 2 else 1
+    expected_workers = active_banks if active_banks > 1 else 0
+    if workers is not None:
+        expected_workers = min(workers, active_banks)
+    bank_window = window // active_banks
+    batches = (count + bank_window - 1) // bank_window
+    runtime = BankRuntime(monkeypatch, reader, expected_workers, batches, active_banks, window)
+    if window < 2:
+        reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = runtime.copy
     kwargs = {}
     if metadata:
         table = registry.create_dsa_pd_mooncake_transfer_targets([[host]])
@@ -386,7 +394,6 @@ def test_overlapping_destinations_wait_for_prior_stream_before_next_batch(monkey
 
 
 def test_direct_only_read_does_not_create_workers_or_touch_staging(monkeypatch):
-    monkeypatch.setitem(envs.env_variables, "VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS", lambda: 4)
     source, target = torch.arange(32, dtype=torch.uint8), torch.zeros(32, dtype=torch.uint8)
     engine = MagicMock()
 
@@ -396,7 +403,7 @@ def test_direct_only_read_does_not_create_workers_or_touch_staging(monkeypatch):
         return 0
 
     engine.batch_transfer_sync_read.side_effect = read
-    reader = make_reader(engine, pipeline=True, window=WINDOW)
+    reader = make_reader(engine, pipeline=True, window=WINDOW, bank_workers=None)
     reader._ensure_dsa_pd_mooncake_staging_tensor = MagicMock(side_effect=AssertionError("unexpected staging"))
     monkeypatch.setattr(torch.npu, "set_device", MagicMock(side_effect=AssertionError("unexpected worker")))
     assert reader.batch_transfer_sync_read("peer", [target.data_ptr()], [source.data_ptr()], [32], "direct") == 0
@@ -435,18 +442,49 @@ def test_worker_device_initialization_failure_does_not_read(monkeypatch):
     case.runtime.assert_drained()
 
 
-@pytest.mark.parametrize("value,expected", [(None, 0), ("0", 0), ("1", 1), ("2", 2), ("4", 4), ("8", 8)])
-def test_worker_count_uses_central_env(monkeypatch, value, expected):
-    name = "VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS"
-    if value is None:
-        monkeypatch.delenv(name, raising=False)
+@pytest.mark.parametrize(
+    "banks,window,expected_banks,expected_workers",
+    [(1, 16, 1, 0), (2, 16, 2, 2), (4, 16, 4, 4), (7, 3, 3, 3), (4, 1, 1, 0)],
+)
+def test_effective_banks_select_workers_and_preserve_bytes(
+    monkeypatch, banks, window, expected_banks, expected_workers
+):
+    case = build(monkeypatch, banks=banks, window=window)
+    assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
+    assert len(case.reader._dsa_pd_mooncake_staging_banks) == expected_banks
+    assert len(case.runtime.threads) == expected_workers
+    assert case.runtime.peak_reads == max(1, expected_workers)
+    assert case.reader._dsa_pd_mooncake_staging_bytes == window * ALIGNMENT
+    for index in range(case.count):
+        assert torch.equal(
+            case.host[index * HOST_STRIDE + 16 : index * HOST_STRIDE + 16 + PIECE_BYTES],
+            case.source[index * PIECE_BYTES : (index + 1) * PIECE_BYTES],
+        )
+    case.runtime.assert_drained()
+
+
+@pytest.mark.parametrize("reason", ["overlap", "probe", "pipeline_off"])
+def test_automatic_workers_retain_serial_fallbacks(monkeypatch, reason):
+    case = build(monkeypatch)
+    case.runtime.workers = 0
+    case.runtime.barrier = None
+    if reason == "overlap":
+        case.args = (case.args[0], [case.host.data_ptr() + 16] * case.count, *case.args[2:])
+    elif reason == "probe":
+        monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
     else:
-        monkeypatch.setenv(name, value)
-    assert envs.env_variables[name]() == expected
+        case.reader._pipeline_landing_enabled = False
+        case.reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = case.runtime.copy
+    assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
+    assert not case.runtime.threads and case.runtime.peak_reads == 1
+    case.runtime.assert_drained()
 
 
-@pytest.mark.parametrize("value", ["-1", "invalid", "1.5"])
-def test_invalid_worker_count_is_rejected(monkeypatch, value):
-    monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS", value)
-    with pytest.raises(ValueError):
-        envs.env_variables["VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS"]()
+def test_removed_worker_environment_cannot_override_automatic_policy(monkeypatch):
+    name = "VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS"
+    monkeypatch.setenv(name, "0")
+    assert name not in envs.env_variables
+    case = build(monkeypatch)
+    assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
+    assert case.runtime.peak_reads == BANKS
+    case.runtime.assert_drained()

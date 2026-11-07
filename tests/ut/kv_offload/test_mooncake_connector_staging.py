@@ -153,6 +153,9 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
     def test_pipeline_four_banks_round_robin(self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls):
+        # Isolate caller-thread bank rotation; automatic workers have separate
+        # concurrent byte-coverage and ownership tests.
+        self.thread._get_dsa_pd_mooncake_bank_workers = lambda _banks: 0
         # BANKS=4 with WINDOW=4 -> one slot per bank; 6 chunks become six
         # single-chunk reads round-robining over banks 0,1,2,3,0,1. Wrapping
         # back to a bank (read 5 -> bank 0) reclaims its slot just-in-time;
@@ -383,6 +386,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
     def test_pipeline_landing_overlaps_windows(self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls):
+        self.thread._get_dsa_pd_mooncake_bank_workers = lambda _banks: 0
         # WINDOW=4 means 4 total staging slots; pipeline splits them into two
         # banks of 2, so 6 chunks become three half-window reads. b1 uses
         # bank 0 (slots 0,1), b2 flips to bank 1 (slots 2,3) with no wait at

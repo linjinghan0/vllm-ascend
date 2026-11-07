@@ -26,9 +26,11 @@ entries:
     text: >-
       Reduced repeated address conversion and alignment calculations while
       splitting DSA Mooncake Host KV transfers into staging slots.
-  - category: feature
+  - category: breaking
     text: >-
-      Added opt-in DSA Mooncake bank workers through
-      VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS (default 0).
-      Bank count and staging capacity remain independent of the worker count;
-      requests retain ownership until workers join and landing copies drain.
+      DSA Mooncake Host workers now follow VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS
+      (default 4) when pipelining is enabled, with one worker per effective bank
+      and serial submission for a single bank, probes, or overlapping destinations.
+      Removed VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS and ignored its old values,
+      so the default pipelined setup now uses four workers instead of the caller
+      thread while preserving staging capacity and ownership until join and drain.

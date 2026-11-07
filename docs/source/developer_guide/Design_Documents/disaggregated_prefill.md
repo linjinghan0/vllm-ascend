@@ -124,14 +124,19 @@ landing streams and per-slot events, and
 Disabling the pipeline retains the synchronous landing path. These controls
 are independent of the `MooncakeConnectorV2` and ModelRunner V2 names.
 
-`VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS` defaults to `0`, preserving serial
-submission on the caller thread. With the pipeline enabled, positive values
-use a request-scoped Host thread pool, limited to the active bank count.
-Compare `1`, `2`, and `4` workers while keeping `BANKS=4`, the staging window,
-and the payload fixed. Each worker sets its NPU device before executing;
+With the pipeline enabled, `BANKS` also selects the Host worker count.
+One effective bank runs on the caller thread without a thread pool; multiple
+effective banks use one Host worker per bank. The count is derived after banks
+are clamped to the staging window. For example, `BANKS=1`, `2`, and `4` use
+`0`, `2`, and `4` workers respectively, with the total staging capacity and
+cache budget unchanged. Each worker sets its NPU device before executing;
 only one task at a time owns a bank, and READ then copy order stays serial
-within that bank. The worker count does not change the bank streams,
-batch geometry, cache budget, or copy settings.
+within that bank.
+
+`VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS` has been removed and is ignored.
+With `PIPELINE=1`, the default `BANKS=4` now uses four workers instead of
+caller-thread submission. Use `BANKS=1` for caller-thread submission, or
+disable the pipeline for the synchronous landing path.
 
 The request lock remains held until every started worker has joined and
 submitted landing work has drained, including failures. Cross-bank destination

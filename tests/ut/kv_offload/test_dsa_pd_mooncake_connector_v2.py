@@ -35,7 +35,7 @@ def clear_registry(monkeypatch):
     registry.reset_dsa_pd_mooncake_kv_registries()
 
 
-def make_reader(engine, *, pipeline=False, window=2):
+def make_reader(engine, *, pipeline=False, window=2, bank_workers=0):
     reader = DSAPDMooncakeStagingReader.__new__(DSAPDMooncakeStagingReader)
     reader.engine = engine
     reader.kv_caches = {}
@@ -48,6 +48,10 @@ def make_reader(engine, *, pipeline=False, window=2):
     reader._pipeline_banks = 2
     reader._landing_streams = [MagicMock(), MagicMock()]
     reader._landing_stream = reader._landing_streams[0]
+    if bank_workers is not None:
+        # Lifecycle/order tests can isolate the serial path or executor sizes.
+        # None exercises the production policy derived from effective banks.
+        reader._get_dsa_pd_mooncake_bank_workers = lambda banks: min(bank_workers, len(banks))
     return reader
 
 
