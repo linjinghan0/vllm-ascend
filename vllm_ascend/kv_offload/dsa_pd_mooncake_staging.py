@@ -92,6 +92,8 @@ class _DSAPDMooncakeStagingBank:
     slot_count: int
     stream: Any
     views: _DSAPDMooncakeLandingViews | None
+    copy_streams: tuple[Any, ...] = ()
+    copy_events: tuple[Any, ...] = ()
     completion_event: Any = None
     completion_pending: bool = False
     inflight_owners: list[tuple[torch.Tensor, ...]] = field(default_factory=list)
@@ -117,6 +119,7 @@ class _DSAPDMooncakeBankBatch:
     remote_src_ptrs: list[int]
     transfer_lengths: list[int]
     copies: tuple[_DSAPDMooncakeStagingCopy, ...]
+    has_overlapping_copies: bool = False
 
 
 @dataclass(frozen=True)
@@ -280,9 +283,16 @@ class DSAPDMooncakeStagingMixin:
         # A failed event wait can leave an old context pending. Finish it before
         # starting another request or dropping the stream/cache ownership.
         self._drain_dsa_pd_mooncake_staging_banks(previous)
+        copy_stream_count = (
+            min(ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK, bank_window)
+            if pipeline_active and not ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE
+            else 1
+        )
         if len(previous) == bank_count and all(
             bank.slot_count == bank_window and bank.stream is stream for bank, stream in zip(previous, streams)
         ):
+            for bank in previous:
+                self._configure_dsa_pd_mooncake_copy_streams(bank, copy_stream_count)
             return previous
         capacity, extra = divmod(_DSA_PD_MOONCAKE_LANDING_VIEW_CACHE_SIZE, bank_count)
         banks = []
@@ -297,9 +307,21 @@ class DSAPDMooncakeStagingMixin:
                 )
             )
         self._dsa_pd_mooncake_staging_banks = tuple(banks)
+        for bank in banks:
+            self._configure_dsa_pd_mooncake_copy_streams(bank, copy_stream_count)
         # Standalone helper calls use bank zero rather than a second cache budget.
         self._dsa_pd_mooncake_landing_views = banks[0].views
         return self._dsa_pd_mooncake_staging_banks
+
+    @staticmethod
+    def _configure_dsa_pd_mooncake_copy_streams(bank: _DSAPDMooncakeStagingBank, count: int) -> None:
+        # The caller drained the old layout before changing its stream owners.
+        streams = bank.copy_streams or (bank.stream,)
+        bank.copy_streams = streams[:count] + tuple(torch.npu.Stream() for _ in range(max(0, count - len(streams))))
+        events = bank.copy_events
+        bank.copy_events = events[: count - 1] + tuple(
+            torch.npu.Event() for _ in range(max(0, count - 1 - len(events)))
+        )
 
     def _prepare_dsa_pd_mooncake_bank_plan(
         self,
@@ -333,9 +355,23 @@ class DSAPDMooncakeStagingMixin:
                     raise RuntimeError("Coalesced DSA Mooncake copy crosses a Host KV tensor boundary.")
                 copies.append(_DSAPDMooncakeStagingCopy(local_dst, length, staging_offset, target_bytes, target_offset))
                 intervals.append((local_dst, local_dst + length, bank_index))
+            has_overlapping_copies = False
+            if len(bank.copy_streams) > 1:
+                furthest_copy_end = -1
+                for copy in sorted(copies, key=lambda item: item.destination):
+                    if copy.destination < furthest_copy_end:
+                        has_overlapping_copies = True
+                        break
+                    furthest_copy_end = max(furthest_copy_end, copy.destination + copy.length)
             batches.append(
                 _DSAPDMooncakeBankBatch(
-                    batch_start, bank_index, local_staging_ptrs, remote_src_ptrs, transfer_lengths, tuple(copies)
+                    batch_start,
+                    bank_index,
+                    local_staging_ptrs,
+                    remote_src_ptrs,
+                    transfer_lengths,
+                    tuple(copies),
+                    has_overlapping_copies,
                 )
             )
         furthest_end, furthest_bank = -1, -1
@@ -393,28 +429,36 @@ class DSAPDMooncakeStagingMixin:
             bank.inflight_owners.append((staging, *(copy.target_bytes for copy in batch.copies)))
             bank.needs_stream_drain = True
             try:
-                with torch.npu.stream(bank.stream):
-                    for copy in batch.copies:
-                        self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
-                            copy.destination,
-                            copy.length,
-                            copy.staging_offset,
-                            staging=staging,
-                            target_bytes=copy.target_bytes,
-                            target_offset=copy.target_offset,
-                            bank=bank,
-                        )
-                    # All copies precede this marker on the same stream. Reuse
-                    # the event only after the previous recording has drained.
-                    if bank.completion_event is None:
-                        bank.completion_event = torch.npu.Event()
-                    bank.completion_event.record(bank.stream)
-                    bank.completion_pending = True
-                    bank.needs_stream_drain = False
+                streams = bank.copy_streams or (bank.stream,)
+                count = 1 if batch.has_overlapping_copies else min(len(streams), max(1, len(batch.copies)))
+                for index, stream in enumerate(streams[:count]):
+                    with torch.npu.stream(stream):
+                        for copy in batch.copies[index::count]:
+                            self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
+                                copy.destination,
+                                copy.length,
+                                copy.staging_offset,
+                                staging=staging,
+                                target_bytes=copy.target_bytes,
+                                target_offset=copy.target_offset,
+                                bank=bank,
+                            )
+                        if index:
+                            bank.copy_events[index - 1].record(stream)
+                # Join auxiliary streams without blocking this Host worker.
+                # The bank event then protects every source slice and target.
+                for event in bank.copy_events[: count - 1]:
+                    bank.stream.wait_event(event)
+                if bank.completion_event is None:
+                    bank.completion_event = torch.npu.Event()
+                bank.completion_event.record(bank.stream)
+                bank.completion_pending = True
+                bank.needs_stream_drain = False
             except Exception:
-                bank.stream.synchronize()
+                self._synchronize_dsa_pd_mooncake_bank_streams(bank)
                 bank.completion_pending = False
                 bank.completion_event = None
+                bank.copy_events = tuple(torch.npu.Event() for _ in bank.copy_events)
                 bank.needs_stream_drain = False
                 raise
         else:
@@ -435,6 +479,18 @@ class DSAPDMooncakeStagingMixin:
             land_exposed_secs += time.perf_counter() - land_started
         return _DSAPDMooncakeBankBatchResult(ret, read_secs, read_settle_secs, land_exposed_secs)
 
+    @staticmethod
+    def _synchronize_dsa_pd_mooncake_bank_streams(bank: _DSAPDMooncakeStagingBank) -> None:
+        first_error = None
+        for stream in bank.copy_streams or (bank.stream,):
+            try:
+                stream.synchronize()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
     def _drain_dsa_pd_mooncake_staging_banks(self, banks: tuple[_DSAPDMooncakeStagingBank, ...]) -> None:
         first_error = None
         for bank in banks:
@@ -447,11 +503,12 @@ class DSAPDMooncakeStagingMixin:
                 bank_error = error
             if bank_error is not None or bank.needs_stream_drain:
                 try:
-                    bank.stream.synchronize()
+                    self._synchronize_dsa_pd_mooncake_bank_streams(bank)
                     bank.completion_pending = False
                     # A failed record/wait may leave the event unusable. Drop
                     # it only after the stream confirms its copies are done.
                     bank.completion_event = None
+                    bank.copy_events = tuple(torch.npu.Event() for _ in bank.copy_events)
                     bank.needs_stream_drain = False
                 except Exception as error:
                     if bank_error is None:
@@ -768,7 +825,8 @@ class DSAPDMooncakeStagingMixin:
                 timing_land_exposed_secs += time.perf_counter() - drain_started
         logger.info(
             "Staged DSA PD mooncake receive timing: request=%s mode=%s batches=%s chunks=%s "
-            "copies=%s plan=%s total_s=%.3f read_s=%.3f read_settle_s=%.3f land_exposed_s=%.3f bank_workers=%s",
+            "copies=%s plan=%s total_s=%.3f read_s=%.3f read_settle_s=%.3f land_exposed_s=%.3f bank_workers=%s "
+            "copy_streams_per_bank=%s",
             remote_request_id,
             "pipeline" if pipeline_active else "sync",
             timing_batches,
@@ -780,6 +838,7 @@ class DSAPDMooncakeStagingMixin:
             timing_read_settle_secs,
             timing_land_exposed_secs,
             workers,
+            len(bank_contexts[0].copy_streams),
         )
         return 0
 

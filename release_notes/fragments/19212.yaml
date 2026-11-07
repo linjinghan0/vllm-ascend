@@ -1,5 +1,11 @@
 pr: 19212
 entries:
+  - category: config
+    text: >-
+      Added VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK (default 1) to
+      distribute independent DSA Host KV landing copies across multiple streams
+      per bank without changing Host worker count or staging capacity.
+      All participating streams complete before staging reuse or receive return.
   - category: performance
     text: >-
       Reused one completion event per DSA Mooncake staging bank and processed

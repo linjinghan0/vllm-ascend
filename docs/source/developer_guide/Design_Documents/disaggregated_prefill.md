@@ -137,6 +137,19 @@ been submitted. Before another READ overwrites that bank's staging, its worker
 waits for the previous recording to complete. The final batch is drained before
 the receive returns; events survive successful drains for reuse across receives.
 
+`VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK` controls landing copy
+streams within each bank (default 1; positive integer, capped by slots per
+bank). For example, `BANKS=4`, `STAGING_WINDOW=16`, and 1/2/4 copy streams
+per bank use at most 4/8/16 copy streams while retaining four Host workers
+and the same READ batches, staging allocation, and total view-cache budget.
+The setting is read at receive boundaries. Independent copy ranges are
+distributed across the bank's streams; overlapping ranges in a batch retain
+their original order on its first stream. Each auxiliary stream records a
+reusable event, which the first stream waits on before recording the bank's
+completion event. Reclaiming staging and completing a receive therefore wait
+for all submitted copies. Pipeline-off and READ probes use one copy stream.
+Additional streams provide execution opportunities, not a guaranteed speedup.
+
 `VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS` has been removed and is ignored.
 With `PIPELINE=1`, the default `BANKS=4` now uses four workers instead of
 caller-thread submission. Use `BANKS=1` for caller-thread submission, or

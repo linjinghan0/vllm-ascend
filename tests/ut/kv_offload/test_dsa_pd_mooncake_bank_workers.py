@@ -49,6 +49,8 @@ class BankRuntime:
         self.event_hook = None
         self.events = []
         self.batch_threads = []
+        self.copy_submissions = []
+        self.wait_hook = None
         self.barrier = threading.Barrier(min(workers, banks, batches)) if workers else None
         self.queues = [[] for _ in range(banks)]
         self.copy = reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv
@@ -63,6 +65,11 @@ class BankRuntime:
                 for task in tuple(runtime.queues[self.index]):
                     runtime.queues[self.index].remove(task)
                     task()
+
+            def wait_event(self, event):
+                if runtime.wait_hook is not None:
+                    runtime.wait_hook(self.index)
+                runtime.queues[self.index].append(event.synchronize)
 
         class Event:
             def __init__(self):
@@ -104,8 +111,9 @@ class BankRuntime:
 
         def submit_copy(*args, **kwargs):
             bank = kwargs["bank"]
-            assert self.local.stream is bank.stream
-            self.queues[bank.stream.index].append(lambda: self.copy(*args, **kwargs))
+            assert self.local.stream in (bank.copy_streams or (bank.stream,))
+            self.copy_submissions.append((bank.stream.index, self.local.stream.index, threading.get_ident()))
+            self.queues[self.local.stream.index].append(lambda: self.copy(*args, **kwargs))
             if self.copy_hook is not None:
                 self.copy_hook(bank.stream.index)
 
@@ -137,6 +145,13 @@ class BankRuntime:
         reader._execute_dsa_pd_mooncake_bank_batch = owned_execute
         reader._ensure_dsa_pd_mooncake_staging_tensor = frozen_allocation
         monkeypatch.setattr(torch.npu, "set_device", set_device)
+
+        def create_stream():
+            stream = Stream(len(self.queues))
+            self.queues.append([])
+            return stream
+
+        monkeypatch.setattr(torch.npu, "Stream", create_stream)
         monkeypatch.setattr(torch.npu, "stream", stream_context)
         monkeypatch.setattr(torch.npu, "Event", Event)
         monkeypatch.setattr(torch.npu, "synchronize", MagicMock())
@@ -145,7 +160,10 @@ class BankRuntime:
     def read(self, session, local, remote, lengths):
         staging_ptr = self.reader._dsa_pd_mooncake_staging_tensor.data_ptr()
         bank_index = (local[0] - staging_ptr) // (ALIGNMENT * (self.window // self.banks))
-        assert not self.queues[bank_index], "READ overwrote staging before the previous copies completed"
+        bank = self.reader._dsa_pd_mooncake_staging_banks[bank_index]
+        assert all(not self.queues[stream.index] for stream in bank.copy_streams), (
+            "READ overwrote staging before the previous copies completed"
+        )
         with self.lock:
             self.reads.append((session, bank_index, tuple(local), tuple(remote), tuple(lengths)))
             ticket = len(self.reads)
@@ -174,8 +192,9 @@ class BankRuntime:
         assert not self.reader._dsa_pd_mooncake_staging_lock.locked()
 
 
-def build(monkeypatch, workers=None, count=37, metadata=True, banks=BANKS, window=WINDOW):
+def build(monkeypatch, workers=None, count=37, metadata=True, banks=BANKS, window=WINDOW, copy_streams=1):
     monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", False)
+    monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", copy_streams)
     storage = torch.empty(ALIGNMENT + count * PIECE_BYTES + 64, dtype=torch.uint8)
     offset = (-storage.data_ptr()) % ALIGNMENT + 64
     source = storage[offset : offset + count * PIECE_BYTES]

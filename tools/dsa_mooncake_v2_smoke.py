@@ -156,6 +156,7 @@ def consumer(args: argparse.Namespace, engine: Any) -> None:
         "staging_bytes": reader._dsa_pd_mooncake_staging_bytes,
         "pipeline": reader._pipeline_landing_enabled,
         "banks": reader._pipeline_banks,
+        "copy_streams_per_bank": len(reader._dsa_pd_mooncake_staging_banks[0].copy_streams),
         "transfer_seconds": elapsed,
     }
     print(json.dumps(result), flush=True)
