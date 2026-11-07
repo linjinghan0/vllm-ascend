@@ -8,7 +8,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from vllm.logger import logger
@@ -100,8 +100,9 @@ class _DSAPDMooncakeStagingBank:
     needs_stream_drain: bool = False
 
 
-@dataclass(frozen=True)
-class _DSAPDMooncakeStagingCopy:
+class _DSAPDMooncakeStagingCopy(NamedTuple):
+    """Immutable copy metadata shared by the planner and its bank worker."""
+
     destination: int
     length: int
     staging_offset: int
@@ -109,8 +110,7 @@ class _DSAPDMooncakeStagingCopy:
     target_offset: int
 
 
-@dataclass(frozen=True)
-class _DSAPDMooncakeBankBatch:
+class _DSAPDMooncakeBankBatch(NamedTuple):
     """Prepared under the request lock; address lists are read-only to executors."""
 
     batch_start: int

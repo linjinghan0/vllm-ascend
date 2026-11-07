@@ -1,5 +1,9 @@
 pr: 19212
 entries:
+  - category: performance
+    text: >-
+      Reduced construction overhead for immutable DSA Mooncake staging copy and
+      batch records while preserving target bounds and overlap validation.
   - category: config
     text: >-
       Added VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK (default 1) to

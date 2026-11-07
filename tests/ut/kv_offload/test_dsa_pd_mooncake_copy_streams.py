@@ -69,7 +69,7 @@ def test_stream_configuration_changes_only_after_prior_copies_drain(monkeypatch)
         assert all(len(bank.copy_streams) == streams for bank in banks)
 
 
-@pytest.mark.parametrize("banks,streams", [(1, 16), (2, 8), (4, 4), (8, 2), (16, 1), (4, 2), (4, 1)])
+@pytest.mark.parametrize("banks,streams", [(1, 16), (2, 8), (4, 4), (8, 2), (16, 1), (4, 2), (4, 1), (2, 1), (8, 1)])
 def test_bank_and_stream_counts_are_independent_with_fixed_staging(monkeypatch, banks, streams):
     case = build(monkeypatch, banks=banks, copy_streams=streams, count=65)
     assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
