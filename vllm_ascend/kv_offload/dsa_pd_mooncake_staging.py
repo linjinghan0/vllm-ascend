@@ -6,6 +6,7 @@ import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -28,7 +29,8 @@ _DSA_PD_MOONCAKE_LANDING_VIEW_CACHE_SIZE = 256
 class _DSAPDMooncakeLandingViews:
     """Bound reusable byte views without owning their source Tensor objects.
 
-    The staging request lock serializes callers. Source slices repeat within a
+    One bank owns each cache; the staging request lock serializes receives.
+    Source slices repeat within a
     receive; destination slices are admitted only after a second access, so a
     one-off destination needs no detach. Cached slices are detached so
     their base Tensor can die and clear its entries, while writes still alias
@@ -76,6 +78,60 @@ class _DSAPDMooncakeLandingViews:
         return view
 
 
+@dataclass
+class _DSAPDMooncakeStagingBank:
+    """Only this bank's executor may mutate its events and view cache.
+
+    Contexts survive receives to reuse views. Pending copies retain their Tensor
+    owners until draining succeeds, including when an event/stream wait fails.
+    The request lock also protects context replacement and final draining.
+    """
+
+    slot_base: int
+    slot_count: int
+    stream: Any
+    views: _DSAPDMooncakeLandingViews | None
+    pending_slot_events: list[Any]
+    inflight_owners: list[tuple[torch.Tensor, ...]] = field(default_factory=list)
+    needs_stream_drain: bool = False
+
+
+@dataclass(frozen=True)
+class _DSAPDMooncakeStagingCopy:
+    destination: int
+    length: int
+    staging_offset: int
+    target_bytes: torch.Tensor
+    target_offset: int
+
+
+@dataclass(frozen=True)
+class _DSAPDMooncakeBankBatch:
+    """Prepared under the request lock; address lists are read-only to executors."""
+
+    batch_start: int
+    bank_index: int
+    local_staging_ptrs: list[int]
+    remote_src_ptrs: list[int]
+    transfer_lengths: list[int]
+    copies: tuple[_DSAPDMooncakeStagingCopy, ...]
+
+
+@dataclass(frozen=True)
+class _DSAPDMooncakeStagingPlan:
+    batches: tuple[_DSAPDMooncakeBankBatch, ...]
+    # Future schedulers must preserve serial order for overlapping bank writes.
+    has_cross_bank_overlap: bool
+
+
+@dataclass(frozen=True)
+class _DSAPDMooncakeBankBatchResult:
+    return_code: int
+    read_secs: float
+    read_settle_secs: float
+    land_exposed_secs: float
+
+
 class DSAPDMooncakeStagingMixin:
     """Own a bounded staging window until every Host KV copy has landed."""
 
@@ -89,6 +145,7 @@ class DSAPDMooncakeStagingMixin:
         self._dsa_pd_mooncake_staging_bytes = 0
         self._dsa_pd_mooncake_staging_lock = threading.Lock()
         self._dsa_pd_mooncake_landing_views = _DSAPDMooncakeLandingViews()
+        self._dsa_pd_mooncake_staging_banks: tuple[_DSAPDMooncakeStagingBank, ...] = ()
         self._pipeline_banks = ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS
         self._landing_streams = [torch.npu.Stream() for _ in range(max(1, self._pipeline_banks))]
         self._landing_stream = self._landing_streams[0]
@@ -134,6 +191,8 @@ class DSAPDMooncakeStagingMixin:
         if self._dsa_pd_mooncake_staging_tensor is not None and self._dsa_pd_mooncake_staging_bytes >= required_bytes:
             return self._dsa_pd_mooncake_staging_tensor
 
+        # Preserve the old allocation if a previous request could not drain it.
+        self._drain_dsa_pd_mooncake_staging_banks(getattr(self, "_dsa_pd_mooncake_staging_banks", ()))
         alignment = 2 * 1024 * 1024
         device = self._get_dsa_pd_mooncake_staging_device()
         storage = torch.empty((required_bytes + alignment,), dtype=torch.int8, device=device)
@@ -164,6 +223,7 @@ class DSAPDMooncakeStagingMixin:
         staging: torch.Tensor | None = None,
         target_bytes: torch.Tensor | None = None,
         target_offset: int = 0,
+        bank: _DSAPDMooncakeStagingBank | None = None,
     ) -> None:
         if target_bytes is None:
             resolved = get_dsa_pd_mooncake_offloaded_kv_byte_tensor(dst, length)
@@ -172,21 +232,35 @@ class DSAPDMooncakeStagingMixin:
             target_bytes, target_offset = resolved
         if staging is None:
             staging = self._ensure_dsa_pd_mooncake_staging_tensor()
-        views = getattr(self, "_dsa_pd_mooncake_landing_views", None)
-        if views is None:
+        views = bank.views if bank is not None else getattr(self, "_dsa_pd_mooncake_landing_views", None)
+        if views is None and bank is None:
             # Keep compatibility with readers constructed without _init in
             # connector integrations and CPU regression fixtures.
             views = self._dsa_pd_mooncake_landing_views = _DSAPDMooncakeLandingViews()
+        if views is None:
+            # Unusual configurations with more banks than cache entries keep
+            # the same total budget by leaving some banks uncached.
+            target_bytes.narrow(0, target_offset, length).copy_(
+                staging[staging_offset : staging_offset + length], non_blocking=False
+            )
+            return
         views.get(target_bytes, target_offset, length).copy_(
             views.get(staging, staging_offset, length, source=True), non_blocking=False
         )
 
     @staticmethod
     def _drain_dsa_pd_mooncake_slot_events(pending_slot_events: list[torch.npu.Event | None]) -> None:
+        first_error = None
         for slot, pending_event in enumerate(pending_slot_events):
             if pending_event is not None:
-                pending_event.synchronize()
-                pending_slot_events[slot] = None
+                try:
+                    pending_event.synchronize()
+                    pending_slot_events[slot] = None
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
 
     @staticmethod
     def _coalesce_dsa_pd_mooncake_copy_plan(copy_plan: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
@@ -207,6 +281,195 @@ class DSAPDMooncakeStagingMixin:
                     continue
             merged.append((dst, length, staging_offset))
         return merged
+
+    def _get_dsa_pd_mooncake_staging_banks(
+        self, bank_count: int, bank_window: int, pipeline_active: bool
+    ) -> tuple[_DSAPDMooncakeStagingBank, ...]:
+        streams = self._landing_streams[:bank_count] if pipeline_active else [self._landing_stream]
+        if len(streams) != bank_count:
+            raise RuntimeError("DSA Mooncake staging bank count exceeds its allocated landing streams.")
+        previous = getattr(self, "_dsa_pd_mooncake_staging_banks", ())
+        # A failed event wait can leave an old context pending. Finish it before
+        # starting another request or dropping the stream/cache ownership.
+        self._drain_dsa_pd_mooncake_staging_banks(previous)
+        if len(previous) == bank_count and all(
+            bank.slot_count == bank_window and bank.stream is stream for bank, stream in zip(previous, streams)
+        ):
+            return previous
+        capacity, extra = divmod(_DSA_PD_MOONCAKE_LANDING_VIEW_CACHE_SIZE, bank_count)
+        banks = []
+        for index, stream in enumerate(streams):
+            budget = capacity + (index < extra)
+            banks.append(
+                _DSAPDMooncakeStagingBank(
+                    slot_base=index * bank_window,
+                    slot_count=bank_window,
+                    stream=stream,
+                    views=_DSAPDMooncakeLandingViews(budget) if budget else None,
+                    pending_slot_events=[None] * bank_window,
+                )
+            )
+        self._dsa_pd_mooncake_staging_banks = tuple(banks)
+        # Standalone helper calls use bank zero rather than a second cache budget.
+        self._dsa_pd_mooncake_landing_views = banks[0].views
+        return self._dsa_pd_mooncake_staging_banks
+
+    def _prepare_dsa_pd_mooncake_bank_plan(
+        self,
+        staged_transfers: list[tuple[int, int, int]],
+        staged_targets: dict[int, tuple[torch.Tensor, int]],
+        staging: torch.Tensor,
+        staging_chunk_bytes: int,
+        banks: tuple[_DSAPDMooncakeStagingBank, ...],
+    ) -> _DSAPDMooncakeStagingPlan:
+        """Freeze all READ arguments and validate landing bounds before dispatch."""
+        staging_ptr = int(staging.data_ptr())
+        bank_window = banks[0].slot_count
+        batches = []
+        intervals = []
+        for batch_start in range(0, len(staged_transfers), bank_window):
+            bank_index = (batch_start // bank_window) % len(banks)
+            bank = banks[bank_index]
+            local_staging_ptrs, remote_src_ptrs, transfer_lengths, copy_plan = [], [], [], []
+            for position, (local_dst, remote_src, length) in enumerate(
+                staged_transfers[batch_start : batch_start + bank_window]
+            ):
+                staging_offset = (bank.slot_base + position) * staging_chunk_bytes + remote_src % (2 * 1024 * 1024)
+                local_staging_ptrs.append(staging_ptr + staging_offset)
+                remote_src_ptrs.append(remote_src)
+                transfer_lengths.append(length)
+                copy_plan.append((local_dst, length, staging_offset))
+            copies = []
+            for local_dst, length, staging_offset in self._coalesce_dsa_pd_mooncake_copy_plan(copy_plan):
+                target_bytes, target_offset = staged_targets[local_dst]
+                if target_offset + length > target_bytes.numel():
+                    raise RuntimeError("Coalesced DSA Mooncake copy crosses a Host KV tensor boundary.")
+                copies.append(_DSAPDMooncakeStagingCopy(local_dst, length, staging_offset, target_bytes, target_offset))
+                intervals.append((local_dst, local_dst + length, bank_index))
+            batches.append(
+                _DSAPDMooncakeBankBatch(
+                    batch_start, bank_index, local_staging_ptrs, remote_src_ptrs, transfer_lengths, tuple(copies)
+                )
+            )
+        furthest_end, furthest_bank = -1, -1
+        overlap = False
+        for start, end, bank_index in sorted(intervals):
+            if start < furthest_end and bank_index != furthest_bank:
+                overlap = True
+                break
+            if end > furthest_end:
+                furthest_end, furthest_bank = end, bank_index
+        return _DSAPDMooncakeStagingPlan(tuple(batches), overlap)
+
+    def _execute_dsa_pd_mooncake_bank_batch(
+        self,
+        session_id: str,
+        bank: _DSAPDMooncakeStagingBank,
+        batch: _DSAPDMooncakeBankBatch,
+        staging: torch.Tensor,
+        pipeline_active: bool,
+        remote_request_id: str,
+    ) -> _DSAPDMooncakeBankBatchResult:
+        """Reclaim, READ, then land one batch without reacquiring the request lock."""
+        land_exposed_secs = 0.0
+        if pipeline_active:
+            reclaim_started = time.perf_counter()
+            for slot in range(len(batch.transfer_lengths)):
+                pending = bank.pending_slot_events[slot]
+                if pending is not None:
+                    pending.synchronize()
+                    bank.pending_slot_events[slot] = None
+            if not any(bank.pending_slot_events):
+                bank.inflight_owners.clear()
+            land_exposed_secs += time.perf_counter() - reclaim_started
+        read_started = time.perf_counter()
+        ret = self.engine.batch_transfer_sync_read(
+            session_id, batch.local_staging_ptrs, batch.remote_src_ptrs, batch.transfer_lengths
+        )
+        read_secs = time.perf_counter() - read_started
+        read_settle_secs = 0.0
+        if ret >= 0 and ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE:
+            settle_started = time.perf_counter()
+            torch.npu.synchronize()
+            read_settle_secs = time.perf_counter() - settle_started
+        if ret < 0:
+            logger.error(
+                "Staged Mooncake batch read failed: request=%s "
+                "batch_start=%s batch_size=%s first_local=%s first_remote=%s first_len=%s ret=%s",
+                remote_request_id,
+                batch.batch_start,
+                len(batch.transfer_lengths),
+                batch.local_staging_ptrs[0],
+                batch.remote_src_ptrs[0],
+                batch.transfer_lengths[0],
+                ret,
+            )
+            return _DSAPDMooncakeBankBatchResult(ret, read_secs, read_settle_secs, land_exposed_secs)
+        if pipeline_active:
+            bank.inflight_owners.append((staging, *(copy.target_bytes for copy in batch.copies)))
+            bank.needs_stream_drain = True
+            try:
+                with torch.npu.stream(bank.stream):
+                    for copy in batch.copies:
+                        self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
+                            copy.destination,
+                            copy.length,
+                            copy.staging_offset,
+                            staging=staging,
+                            target_bytes=copy.target_bytes,
+                            target_offset=copy.target_offset,
+                            bank=bank,
+                        )
+                    for slot in range(len(batch.transfer_lengths)):
+                        landing_event = torch.npu.Event()
+                        landing_event.record(bank.stream)
+                        bank.pending_slot_events[slot] = landing_event
+                    bank.needs_stream_drain = False
+            except Exception:
+                bank.stream.synchronize()
+                bank.needs_stream_drain = False
+                raise
+        else:
+            land_started = time.perf_counter()
+            try:
+                for copy in batch.copies:
+                    self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
+                        copy.destination,
+                        copy.length,
+                        copy.staging_offset,
+                        staging=staging,
+                        target_bytes=copy.target_bytes,
+                        target_offset=copy.target_offset,
+                        bank=bank,
+                    )
+            finally:
+                torch.npu.synchronize()
+            land_exposed_secs += time.perf_counter() - land_started
+        return _DSAPDMooncakeBankBatchResult(ret, read_secs, read_settle_secs, land_exposed_secs)
+
+    def _drain_dsa_pd_mooncake_staging_banks(self, banks: tuple[_DSAPDMooncakeStagingBank, ...]) -> None:
+        first_error = None
+        for bank in banks:
+            bank_error = None
+            try:
+                self._drain_dsa_pd_mooncake_slot_events(bank.pending_slot_events)
+            except Exception as error:
+                bank_error = error
+            if bank_error is not None or bank.needs_stream_drain:
+                try:
+                    bank.stream.synchronize()
+                    bank.pending_slot_events[:] = [None] * bank.slot_count
+                    bank.needs_stream_drain = False
+                except Exception as error:
+                    if bank_error is None:
+                        bank_error = error
+            if not bank.needs_stream_drain and not any(bank.pending_slot_events):
+                bank.inflight_owners.clear()
+            # A failed wait on one bank must not skip the other banks.
+            if first_error is None and bank_error is not None:
+                first_error = bank_error
+        if first_error is not None:
+            raise first_error
 
     def _batch_transfer_sync_read_with_optional_staging(
         self,
@@ -316,7 +579,6 @@ class DSAPDMooncakeStagingMixin:
             return 0
 
         staging = self._ensure_dsa_pd_mooncake_staging_tensor()
-        staging_ptr = int(staging.data_ptr())
         staging_window = self._get_dsa_pd_mooncake_staging_window()
         # Pipeline mode: WINDOW keeps meaning the total staging capacity and
         # the buffer is split into BANKS banks of window/BANKS slots that
@@ -346,9 +608,7 @@ class DSAPDMooncakeStagingMixin:
         # Trailing slots stay idle when the window is not divisible by the
         # bank count; every bank keeps bank_window contiguous slots.
         bank_window = (staging_window // banks) if pipeline_active else staging_window
-        pending_slot_events: list[torch.npu.Event | None] = [None] * (
-            banks * bank_window if pipeline_active else staging_window
-        )
+        bank_contexts = self._get_dsa_pd_mooncake_staging_banks(banks, bank_window, pipeline_active)
         # Per-receive timing (one INFO line per request): read_s is the
         # network stage, land_exposed_s the landing time spent on the
         # critical path (waits plus, in sync modes, the copies themselves).
@@ -367,113 +627,27 @@ class DSAPDMooncakeStagingMixin:
         timing_plan_entries = 0
         timing_copy_calls = 0
         try:
-            for batch_start in range(0, len(staged_transfers), bank_window):
-                batch = staged_transfers[batch_start : batch_start + bank_window]
-                bank_index = (batch_start // bank_window) % banks if pipeline_active else 0
-                bank_slot_base = bank_index * bank_window if pipeline_active else 0
-                landing_stream = self._landing_streams[bank_index] if pipeline_active else self._landing_stream
-                local_staging_ptrs = []
-                remote_src_ptrs = []
-                transfer_lengths = []
-                copy_plan = []
-                for position, (local_dst, remote_src, length) in enumerate(batch):
-                    slot = bank_slot_base + position
-                    staging_base_offset = slot * staging_chunk_bytes
-                    staging_offset = staging_base_offset + int(remote_src) % (2 * 1024 * 1024)
-                    local_staging_ptrs.append(staging_ptr + staging_offset)
-                    remote_src_ptrs.append(remote_src)
-                    transfer_lengths.append(length)
-                    copy_plan.append((local_dst, length, staging_offset))
-                timing_plan_entries += len(copy_plan)
-                copy_plan = self._coalesce_dsa_pd_mooncake_copy_plan(copy_plan)
-                timing_copy_calls += len(copy_plan)
-                # Resolve before READ, reusing byte views across receives.
-                # Source and destination slices remain on the landing stream.
-                prepared_targets = []
-                for local_dst, length, staging_offset in copy_plan:
-                    target_bytes, target_offset = staged_targets[local_dst]
-                    if target_offset + length > target_bytes.numel():
-                        raise RuntimeError("Coalesced DSA Mooncake copy crosses a Host KV tensor boundary.")
-                    prepared_targets.append((target_bytes, target_offset))
-                if pipeline_active:
-                    reclaim_started = time.perf_counter()
-                    for slot in range(bank_slot_base, bank_slot_base + len(batch)):
-                        pending_event = pending_slot_events[slot]
-                        if pending_event is not None:
-                            pending_event.synchronize()
-                            pending_slot_events[slot] = None
-                    timing_land_exposed_secs += time.perf_counter() - reclaim_started
-                read_started = time.perf_counter()
-                ret = self.engine.batch_transfer_sync_read(
-                    session_id, local_staging_ptrs, remote_src_ptrs, transfer_lengths
+            plan = self._prepare_dsa_pd_mooncake_bank_plan(
+                staged_transfers, staged_targets, staging, staging_chunk_bytes, bank_contexts
+            )
+            # Keep the original global READ order. C1 only moves ownership and
+            # execution into bank contexts; no worker or second KV stream runs.
+            for batch in plan.batches:
+                result = self._execute_dsa_pd_mooncake_bank_batch(
+                    session_id, bank_contexts[batch.bank_index], batch, staging, pipeline_active, remote_request_id
                 )
-                timing_read_secs += time.perf_counter() - read_started
-                if ret >= 0 and ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE:
-                    # Timing-probe runs only: reveals whether read_s was the full
-                    # network transfer or just its submission (see envs.py).
-                    settle_started = time.perf_counter()
-                    torch.npu.synchronize()
-                    timing_read_settle_secs += time.perf_counter() - settle_started
-                if ret < 0:
-                    logger.error(
-                        "Staged Mooncake batch read failed: request=%s "
-                        "batch_start=%s batch_size=%s first_local=%s first_remote=%s first_len=%s ret=%s",
-                        remote_request_id,
-                        batch_start,
-                        len(batch),
-                        local_staging_ptrs[0] if local_staging_ptrs else None,
-                        remote_src_ptrs[0] if remote_src_ptrs else None,
-                        transfer_lengths[0] if transfer_lengths else None,
-                        ret,
-                    )
-                    return ret
-                if pipeline_active:
-                    try:
-                        with torch.npu.stream(landing_stream):
-                            for (local_dst, length, staging_offset), (target_bytes, target_offset) in zip(
-                                copy_plan, prepared_targets
-                            ):
-                                self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
-                                    local_dst,
-                                    length,
-                                    staging_offset,
-                                    staging=staging,
-                                    target_bytes=target_bytes,
-                                    target_offset=target_offset,
-                                )
-                            for slot in range(bank_slot_base, bank_slot_base + len(batch)):
-                                landing_event = torch.npu.Event()
-                                landing_event.record(landing_stream)
-                                pending_slot_events[slot] = landing_event
-                    except Exception:
-                        landing_stream.synchronize()
-                        raise
-                    timing_batches += 1
-                else:
-                    # Synchronous fallback (kill switch off, or window < 2):
-                    # device-wide sync keeps the legacy v0 contract.
-                    land_started = time.perf_counter()
-                    try:
-                        for (local_dst, length, staging_offset), (target_bytes, target_offset) in zip(
-                            copy_plan, prepared_targets
-                        ):
-                            self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
-                                local_dst,
-                                length,
-                                staging_offset,
-                                staging=staging,
-                                target_bytes=target_bytes,
-                                target_offset=target_offset,
-                            )
-                    finally:
-                        torch.npu.synchronize()
-                    timing_land_exposed_secs += time.perf_counter() - land_started
-                    timing_batches += 1
-
+                timing_read_secs += result.read_secs
+                timing_read_settle_secs += result.read_settle_secs
+                timing_land_exposed_secs += result.land_exposed_secs
+                if result.return_code < 0:
+                    return result.return_code
+                timing_plan_entries += len(batch.transfer_lengths)
+                timing_copy_calls += len(batch.copies)
+                timing_batches += 1
         finally:
             if pipeline_active:
                 drain_started = time.perf_counter()
-                self._drain_dsa_pd_mooncake_slot_events(pending_slot_events)
+                self._drain_dsa_pd_mooncake_staging_banks(bank_contexts)
                 timing_land_exposed_secs += time.perf_counter() - drain_started
         logger.info(
             "Staged DSA PD mooncake receive timing: request=%s mode=%s batches=%s chunks=%s "
