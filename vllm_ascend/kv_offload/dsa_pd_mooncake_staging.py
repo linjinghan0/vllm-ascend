@@ -92,7 +92,8 @@ class _DSAPDMooncakeStagingBank:
     slot_count: int
     stream: Any
     views: _DSAPDMooncakeLandingViews | None
-    pending_slot_events: list[Any]
+    completion_event: Any = None
+    completion_pending: bool = False
     inflight_owners: list[tuple[torch.Tensor, ...]] = field(default_factory=list)
     needs_stream_drain: bool = False
 
@@ -250,20 +251,6 @@ class DSAPDMooncakeStagingMixin:
         )
 
     @staticmethod
-    def _drain_dsa_pd_mooncake_slot_events(pending_slot_events: list[torch.npu.Event | None]) -> None:
-        first_error = None
-        for slot, pending_event in enumerate(pending_slot_events):
-            if pending_event is not None:
-                try:
-                    pending_event.synchronize()
-                    pending_slot_events[slot] = None
-                except Exception as error:
-                    if first_error is None:
-                        first_error = error
-        if first_error is not None:
-            raise first_error
-
-    @staticmethod
     def _coalesce_dsa_pd_mooncake_copy_plan(copy_plan: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
         """Merge adjacent plan entries that are contiguous on both sides.
 
@@ -307,7 +294,6 @@ class DSAPDMooncakeStagingMixin:
                     slot_count=bank_window,
                     stream=stream,
                     views=_DSAPDMooncakeLandingViews(budget) if budget else None,
-                    pending_slot_events=[None] * bank_window,
                 )
             )
         self._dsa_pd_mooncake_staging_banks = tuple(banks)
@@ -375,13 +361,10 @@ class DSAPDMooncakeStagingMixin:
         land_exposed_secs = 0.0
         if pipeline_active:
             reclaim_started = time.perf_counter()
-            for slot in range(len(batch.transfer_lengths)):
-                pending = bank.pending_slot_events[slot]
-                if pending is not None:
-                    pending.synchronize()
-                    bank.pending_slot_events[slot] = None
-            if not any(bank.pending_slot_events):
-                bank.inflight_owners.clear()
+            if bank.completion_pending:
+                bank.completion_event.synchronize()
+                bank.completion_pending = False
+            bank.inflight_owners.clear()
             land_exposed_secs += time.perf_counter() - reclaim_started
         read_started = time.perf_counter()
         ret = self.engine.batch_transfer_sync_read(
@@ -421,13 +404,17 @@ class DSAPDMooncakeStagingMixin:
                             target_offset=copy.target_offset,
                             bank=bank,
                         )
-                    for slot in range(len(batch.transfer_lengths)):
-                        landing_event = torch.npu.Event()
-                        landing_event.record(bank.stream)
-                        bank.pending_slot_events[slot] = landing_event
+                    # All copies precede this marker on the same stream. Reuse
+                    # the event only after the previous recording has drained.
+                    if bank.completion_event is None:
+                        bank.completion_event = torch.npu.Event()
+                    bank.completion_event.record(bank.stream)
+                    bank.completion_pending = True
                     bank.needs_stream_drain = False
             except Exception:
                 bank.stream.synchronize()
+                bank.completion_pending = False
+                bank.completion_event = None
                 bank.needs_stream_drain = False
                 raise
         else:
@@ -453,18 +440,23 @@ class DSAPDMooncakeStagingMixin:
         for bank in banks:
             bank_error = None
             try:
-                self._drain_dsa_pd_mooncake_slot_events(bank.pending_slot_events)
+                if bank.completion_pending:
+                    bank.completion_event.synchronize()
+                    bank.completion_pending = False
             except Exception as error:
                 bank_error = error
             if bank_error is not None or bank.needs_stream_drain:
                 try:
                     bank.stream.synchronize()
-                    bank.pending_slot_events[:] = [None] * bank.slot_count
+                    bank.completion_pending = False
+                    # A failed record/wait may leave the event unusable. Drop
+                    # it only after the stream confirms its copies are done.
+                    bank.completion_event = None
                     bank.needs_stream_drain = False
                 except Exception as error:
                     if bank_error is None:
                         bank_error = error
-            if not bank.needs_stream_drain and not any(bank.pending_slot_events):
+            if not bank.needs_stream_drain and not bank.completion_pending:
                 bank.inflight_owners.clear()
             # A failed wait on one bank must not skip the other banks.
             if first_error is None and bank_error is not None:
@@ -485,10 +477,10 @@ class DSAPDMooncakeStagingMixin:
         remote_request_id: str,
         workers: int,
     ) -> list[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]]:
-        """Dispatch at most one outstanding task per bank under the caller's lock.
+        """Run each bank's queue in one task under the caller's request lock.
 
-        A task keeps READ -> copy order within its bank. Only the coordinator
-        assigns the next batch after that bank's previous future has finished.
+        A task keeps reclaim -> READ -> copy order within its bank and advances
+        without a coordinator round trip between batches.
         Device setup is thread-local; the staging allocation and all target
         validation are complete before the pool starts. The pool is joined on
         every exit, leaving final stream/event draining to the coordinator.
@@ -496,25 +488,33 @@ class DSAPDMooncakeStagingMixin:
         bank_batches: list[list[_DSAPDMooncakeBankBatch]] = [[] for _ in banks]
         for batch in plan.batches:
             bank_batches[batch.bank_index].append(batch)
-        queues = [iter(batches) for batches in bank_batches]
         stopped = threading.Event()
         completed = {}
         failures: dict[int, BaseException] = {}
-        pending: dict[Future, _DSAPDMooncakeBankBatch] = {}
+        pending: dict[Future, int] = {}
 
-        def execute(batch: _DSAPDMooncakeBankBatch) -> _DSAPDMooncakeBankBatchResult | None:
-            if stopped.is_set():
-                return None
-            try:
-                result = self._execute_dsa_pd_mooncake_bank_batch(
-                    session_id, banks[batch.bank_index], batch, staging, True, remote_request_id
-                )
-            except BaseException:
-                stopped.set()
-                raise
-            if result.return_code < 0:
-                stopped.set()
-            return result
+        def execute(
+            batches: list[_DSAPDMooncakeBankBatch],
+        ) -> tuple[
+            list[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]],
+            tuple[int, BaseException] | None,
+        ]:
+            results = []
+            for batch in batches:
+                if stopped.is_set():
+                    break
+                try:
+                    result = self._execute_dsa_pd_mooncake_bank_batch(
+                        session_id, banks[batch.bank_index], batch, staging, True, remote_request_id
+                    )
+                except BaseException as error:
+                    stopped.set()
+                    return results, (batch.batch_start, error)
+                results.append((batch, result))
+                if result.return_code < 0:
+                    stopped.set()
+                    break
+            return results, None
 
         pool = ThreadPoolExecutor(
             max_workers=min(workers, len(banks)),
@@ -523,30 +523,27 @@ class DSAPDMooncakeStagingMixin:
             initargs=(staging.device,),
         )
         try:
-            for queue in queues:
+            for batches in bank_batches:
                 if stopped.is_set():
                     break
-                batch = next(queue, None)
-                if batch is not None:
-                    pending[pool.submit(execute, batch)] = batch
+                if batches:
+                    pending[pool.submit(execute, batches)] = batches[0].batch_start
             while pending:
                 finished, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in sorted(finished, key=lambda value: pending[value].batch_start):
-                    batch = pending.pop(future)
+                for future in sorted(finished, key=lambda value: pending[value]):
+                    batch_start = pending.pop(future)
                     if future.cancelled():
                         continue
                     try:
-                        result = future.result()
+                        results, failure = future.result()
                     except BaseException as error:
-                        failures[batch.batch_start] = error
+                        failures[batch_start] = error
                         stopped.set()
                     else:
-                        if result is not None:
+                        for batch, result in results:
                             completed[batch.batch_start] = (batch, result)
-                    if not stopped.is_set():
-                        following = next(queues[batch.bank_index], None)
-                        if following is not None:
-                            pending[pool.submit(execute, following)] = following
+                        if failure is not None:
+                            failures[failure[0]] = failure[1]
                 if stopped.is_set():
                     for future in pending:
                         future.cancel()
@@ -678,7 +675,7 @@ class DSAPDMooncakeStagingMixin:
         # accordingly; the staging footprint is identical with the pipeline
         # on or off). Flipping to a fresh bank needs no wait at all, so one
         # read's landing hides under the next reads; coming back to a bank
-        # BANKS reads later is guarded by a just-in-time per-slot wait. The
+        # BANKS reads later is guarded by a just-in-time bank-event wait. The
         # final drain keeps the external contract: returning 0 means every
         # window has landed and is visible.
         pipeline_active = self._pipeline_landing_enabled and staging_window >= 2

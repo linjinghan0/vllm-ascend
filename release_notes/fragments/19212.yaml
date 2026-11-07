@@ -1,5 +1,10 @@
 pr: 19212
 entries:
+  - category: performance
+    text: >-
+      Reused one completion event per DSA Mooncake staging bank and processed
+      each bank queue in one Host task to reduce event and Future overhead,
+      preserving staging reuse waits and final landing synchronization.
   - category: bugfix
     text: >-
       Fixed MooncakeConnectorV2 Host KV allocation for DSA/SFA main caches on Model Runner V2.

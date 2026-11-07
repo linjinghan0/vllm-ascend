@@ -181,7 +181,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
             event.synchronize.side_effect = lambda: order.append(f"wait{name}")
             return event
 
-        events = [make_event(str(i)) for i in range(6)]
+        events = [make_event(str(i)) for i in range(4)]
         mock_event_cls.side_effect = events
 
         def record_read(*args, **kwargs) -> int:
@@ -214,22 +214,24 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
                 # read 5 wraps back to bank 0: reclaim slot 0 first
                 "wait0",
                 "read",
-                "rec4",
+                "rec0",
                 # read 6 wraps back to bank 1: reclaim slot 1 first
                 "wait1",
                 "read",
-                "rec5",
-                # final drain in slot order: 0,1,2,3
-                "wait4",
-                "wait5",
+                "rec1",
+                # final drain in bank order: 0,1,2,3
+                "wait0",
+                "wait1",
                 "wait2",
                 "wait3",
             ],
         )
         self.assertEqual(self.thread.engine.batch_transfer_sync_read.call_count, 6)
-        # bank of chunk i = i % 4 -> stream index 0,1,2,3,0,1
+        self.assertEqual(mock_event_cls.call_count, 4)
         for i, event in enumerate(events):
-            event.record.assert_called_once_with(streams[i % 4])
+            count = 2 if i < 2 else 1
+            self.assertEqual(event.record.call_args_list, [unittest.mock.call(streams[i])] * count)
+            self.assertEqual(event.synchronize.call_count, count)
         self.assertEqual(
             mock_stream.call_args_list,
             [unittest.mock.call(s) for s in [streams[0], streams[1], streams[2], streams[3], streams[0], streams[1]]],
@@ -334,10 +336,10 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         mock_stream.assert_called_with(self.thread._landing_stream)
         mock_sync.assert_not_called()
         mock_register_buffer.assert_not_called()
-        # Every slot records an event on the landing stream (2 + 1 slots); the
-        # per-slot awaits happen at the JIT reclaim of window 2 and the drain.
-        self.assertGreaterEqual(mock_event_cls.return_value.record.call_count, 3)
-        self.assertGreaterEqual(mock_event_cls.return_value.synchronize.call_count, 3)
+        # One reusable event covers each bank batch, including the partial tail.
+        mock_event_cls.assert_called_once()
+        self.assertEqual(mock_event_cls.return_value.record.call_count, 2)
+        self.assertEqual(mock_event_cls.return_value.synchronize.call_count, 2)
         self.assertEqual(
             copied,
             [
@@ -420,7 +422,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
             event.synchronize.side_effect = lambda: order.append(f"wait{name}")
             return event
 
-        events = [make_event(str(i)) for i in range(6)]
+        events = [make_event(str(i)) for i in range(2)]
         mock_event_cls.side_effect = events
 
         def record_read(*args, **kwargs) -> int:
@@ -441,37 +443,30 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         self.assertEqual(
             order,
             [
-                # b1 (bank 0): read, submit, record per slot
+                # b1 (bank 0): all copies, then one completion marker
                 "read",
                 "rec0",
-                "rec1",
                 # b2 (bank 1): bank flip -> read starts with no wait
                 "read",
-                "rec2",
-                "rec3",
+                "rec1",
                 # b3 (bank 0 again): reclaim slots 0 and 1 before overwriting
                 "wait0",
-                "wait1",
                 "read",
-                "rec4",
-                "rec5",
-                # final drain: slots 0,1,2,3
-                "wait4",
-                "wait5",
-                "wait2",
-                "wait3",
+                "rec0",
+                # final drain: one marker per bank
+                "wait0",
+                "wait1",
             ],
         )
         self.assertEqual(self.thread.engine.batch_transfer_sync_read.call_count, 3)
-        self.assertEqual(mock_event_cls.call_count, 6)
+        self.assertEqual(mock_event_cls.call_count, 2)
         # Each bank's copies are submitted and recorded on that bank's own
         # stream: bank 0 (slots 0,1) on stream 0, bank 1 (slots 2,3) on
         # stream 1, so the two banks' landings can execute in parallel.
         stream0, stream1 = self.thread._landing_streams
-        expected_stream_per_event = [stream0, stream0, stream1, stream1, stream0, stream0]
-        for event, expected_stream in zip(events, expected_stream_per_event):
-            event.record.assert_called_once_with(expected_stream)
-            event.synchronize.assert_called_once()
+        for event, expected_stream, count in zip(events, [stream0, stream1], [2, 1]):
+            self.assertEqual(event.record.call_args_list, [unittest.mock.call(expected_stream)] * count)
+            self.assertEqual(event.synchronize.call_count, count)
         mock_sync.assert_not_called()
         self.assertEqual(
             mock_stream.call_args_list,

@@ -119,7 +119,7 @@ one staging lock through READ and landing.
 `VLLM_ASCEND_DSA_PD_MOONCAKE_STAGING_WINDOW` keeps its total slot count
 (default 16), with each slot rounded to at least 2 MiB. Source page offsets
 are preserved. `VLLM_ASCEND_DSA_PD_MOONCAKE_PIPELINE=1` enables the existing
-landing streams and per-slot events, and
+landing streams and one reusable completion event per bank, and
 `VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS` sets their bank count (default 4).
 Disabling the pipeline retains the synchronous landing path. These controls
 are independent of the `MooncakeConnectorV2` and ModelRunner V2 names.
@@ -130,8 +130,12 @@ effective banks use one Host worker per bank. The count is derived after banks
 are clamped to the staging window. For example, `BANKS=1`, `2`, and `4` use
 `0`, `2`, and `4` workers respectively, with the total staging capacity and
 cache budget unchanged. Each worker sets its NPU device before executing;
-only one task at a time owns a bank, and READ then copy order stays serial
-within that bank.
+one task owns each bank's entire request queue, keeping READ then copy order
+serial within that bank without coordinator resubmission between batches.
+Each batch records its completion event once after all landing copies have
+been submitted. Before another READ overwrites that bank's staging, its worker
+waits for the previous recording to complete. The final batch is drained before
+the receive returns; events survive successful drains for reuse across receives.
 
 `VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS` has been removed and is ignored.
 With `PIPELINE=1`, the default `BANKS=4` now uses four workers instead of

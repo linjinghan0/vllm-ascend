@@ -47,6 +47,8 @@ class BankRuntime:
         self.read_hook = None
         self.copy_hook = None
         self.event_hook = None
+        self.events = []
+        self.batch_threads = []
         self.barrier = threading.Barrier(min(workers, banks, batches)) if workers else None
         self.queues = [[] for _ in range(banks)]
         self.copy = reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv
@@ -63,18 +65,28 @@ class BankRuntime:
                     task()
 
         class Event:
+            def __init__(self):
+                self.tasks = ()
+                self.records = 0
+                self.waits = 0
+                runtime.events.append(self)
+
             def record(self, stream):
+                assert not self.tasks, "event reused before its previous copies completed"
                 self.stream = stream
                 self.tasks = tuple(runtime.queues[stream.index])
+                self.records += 1
                 if runtime.event_hook is not None:
                     runtime.event_hook(stream.index)
 
             def synchronize(self):
                 assert reader._dsa_pd_mooncake_staging_lock.locked()
+                self.waits += 1
                 for task in self.tasks:
                     if task in runtime.queues[self.stream.index]:
                         runtime.queues[self.stream.index].remove(task)
                         task()
+                self.tasks = ()
 
         def set_device(device):
             self.local.device = device
@@ -106,6 +118,7 @@ class BankRuntime:
             with self.lock:
                 assert batch.bank_index not in self.bank_owners
                 self.bank_owners.add(batch.bank_index)
+                self.batch_threads.append((batch.bank_index, threading.current_thread()))
             try:
                 return execute(session, bank, batch, *args)
             finally:
@@ -132,6 +145,7 @@ class BankRuntime:
     def read(self, session, local, remote, lengths):
         staging_ptr = self.reader._dsa_pd_mooncake_staging_tensor.data_ptr()
         bank_index = (local[0] - staging_ptr) // (ALIGNMENT * (self.window // self.banks))
+        assert not self.queues[bank_index], "READ overwrote staging before the previous copies completed"
         with self.lock:
             self.reads.append((session, bank_index, tuple(local), tuple(remote), tuple(lengths)))
             ticket = len(self.reads)
@@ -154,7 +168,7 @@ class BankRuntime:
         assert not self.bank_owners and self.active_reads == 0
         assert all(not queue for queue in self.queues)
         for bank in self.reader._dsa_pd_mooncake_staging_banks:
-            assert not any(bank.pending_slot_events)
+            assert not bank.completion_pending
             assert not bank.inflight_owners and not bank.needs_stream_drain
         assert all(not thread.is_alive() for thread in self.threads)
         assert not self.reader._dsa_pd_mooncake_staging_lock.locked()
@@ -215,13 +229,87 @@ def test_worker_counts_preserve_bytes_geometry_and_exclusive_bank_ownership(monk
         actual = [pointer for row in reads if row[1] == bank_index for pointer in row[3]]
         expected = [case.args[2][i] for i in range(count) if (i // (WINDOW // BANKS)) % BANKS == bank_index]
         assert actual == expected
-    if workers <= 1:
+    if workers == 0:
         assert [pointer for row in reads for pointer in row[3]] == case.args[2]
     assert case.runtime.peak_reads == (min(workers, BANKS, len(reads)) if workers else 1)
     assert len(case.runtime.threads) <= min(workers, BANKS)
     assert case.reader._dsa_pd_mooncake_staging_bytes == WINDOW * ALIGNMENT
     assert sum(bank.views.capacity for bank in case.reader._dsa_pd_mooncake_staging_banks) == 256
     case.runtime.assert_drained()
+
+
+def test_fragmented_request_submits_one_task_per_bank_and_reuses_completion_events(monkeypatch):
+    case = build(monkeypatch, count=2574)
+    submitted = []
+
+    class CountingPool(ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            submitted.append(args)
+            return super().submit(*args, **kwargs)
+
+    monkeypatch.setattr(staging_module, "ThreadPoolExecutor", CountingPool)
+    for _ in range(2):
+        case.source.add_(1)
+        assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
+        for index in range(case.count):
+            assert torch.equal(
+                case.host[index * HOST_STRIDE + 16 : index * HOST_STRIDE + 16 + PIECE_BYTES],
+                case.source[index * PIECE_BYTES : (index + 1) * PIECE_BYTES],
+            )
+        case.runtime.assert_drained()
+        case.runtime.batch_threads.clear()
+    assert len(submitted) == 2 * BANKS
+    assert len(case.runtime.reads) == 2 * 644
+    assert len(case.runtime.events) == BANKS
+    assert sum(event.records for event in case.runtime.events) == 2 * 644
+    assert sum(event.waits for event in case.runtime.events) == 2 * 644
+
+
+def test_bank_advances_without_coordinator_collecting_a_future(monkeypatch):
+    case = build(monkeypatch)
+    advanced = threading.Event()
+    counts = [0] * BANKS
+    original_wait = staging_module.wait
+
+    def read(bank):
+        counts[bank] += 1
+        if counts[bank] == 2:
+            advanced.set()
+
+    def wait(*args, **kwargs):
+        assert advanced.wait(5), "worker depended on coordinator resubmission"
+        return original_wait(*args, **kwargs)
+
+    case.runtime.read_hook = read
+    monkeypatch.setattr(staging_module, "wait", wait)
+    assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
+    for bank in range(BANKS):
+        assert len({thread for index, thread in case.runtime.batch_threads if index == bank}) == 1
+    case.runtime.assert_drained()
+
+
+def test_failed_record_replaces_event_before_next_request(monkeypatch):
+    case = build(monkeypatch)
+    failed = False
+
+    def fail_once(bank):
+        nonlocal failed
+        if bank == 0 and not failed:
+            failed = True
+            raise RuntimeError("event record failed")
+
+    case.runtime.event_hook = fail_once
+    with pytest.raises(RuntimeError, match="event record failed"):
+        case.reader.batch_transfer_sync_read(*case.args, **case.kwargs)
+    case.runtime.assert_drained()
+    assert case.reader._dsa_pd_mooncake_staging_banks[0].completion_event is None
+    assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
+    case.runtime.assert_drained()
+    for index in range(case.count):
+        assert torch.equal(
+            case.host[index * HOST_STRIDE + 16 : index * HOST_STRIDE + 16 + PIECE_BYTES],
+            case.source[index * PIECE_BYTES : (index + 1) * PIECE_BYTES],
+        )
 
 
 @pytest.mark.parametrize("failure", ["negative", "read_exception", "copy_exception", "event_record"])

@@ -52,6 +52,7 @@ class DelayedLanding:
                     if task in runtime.pending[id(self.stream)]:
                         runtime.pending[id(self.stream)].remove(task)
                         task()
+                self.tasks = ()
 
         @contextmanager
         def stream_context(stream):
@@ -147,7 +148,7 @@ def test_serial_bank_batches_preserve_bytes_with_delayed_events(monkeypatch, ban
             slot_start = (bank.slot_base + position) * ALIGNMENT
             assert dst == reader._dsa_pd_mooncake_staging_tensor.data_ptr() + slot_start + src % ALIGNMENT
             assert dst + size <= reader._dsa_pd_mooncake_staging_tensor.data_ptr() + slot_start + ALIGNMENT
-    assert all(not any(bank.pending_slot_events) for bank in contexts)
+    assert all(not bank.completion_pending for bank in contexts)
     assert all(not bank.inflight_owners for bank in contexts)
     assert all(not pending for pending in runtime.pending.values())
     assert not reader._dsa_pd_mooncake_staging_lock.locked()
@@ -159,7 +160,7 @@ def test_bank_cache_budget_and_context_lifetime_are_bounded(banks):
     reader._landing_streams = [MagicMock() for _ in range(banks)]
     contexts = reader._get_dsa_pd_mooncake_staging_banks(banks, 1, True)
     assert [bank.slot_base for bank in contexts] == list(range(banks))
-    assert len({id(bank.pending_slot_events) for bank in contexts}) == banks
+    assert all(bank.completion_event is None and not bank.completion_pending for bank in contexts)
     views = [bank.views for bank in contexts if bank.views is not None]
     assert len({id(cache) for cache in views}) == len(views)
     assert sum(cache.capacity for cache in views) == staging_module._DSA_PD_MOONCAKE_LANDING_VIEW_CACHE_SIZE
@@ -196,12 +197,13 @@ def test_layout_change_drains_previous_bank_events_before_replacement():
     previous = reader._get_dsa_pd_mooncake_staging_banks(2, 2, True)
     events = [MagicMock(), MagicMock()]
     for bank, event in zip(previous, events):
-        bank.pending_slot_events[0] = event
+        bank.completion_event = event
+        bank.completion_pending = True
     new = reader._get_dsa_pd_mooncake_staging_banks(1, 4, True)
     assert len(new) == 1 and new[0] not in previous
     for event in events:
         event.synchronize.assert_called_once()
-    assert all(not any(bank.pending_slot_events) for bank in previous)
+    assert all(not bank.completion_pending for bank in previous)
 
 
 @pytest.mark.parametrize("overlap", [False, True])
@@ -235,24 +237,25 @@ def test_all_coalesced_target_bounds_are_checked_before_first_staged_read():
     reader.engine.batch_transfer_sync_read.assert_not_called()
 
 
-def test_failed_event_wait_does_not_skip_other_slots_or_banks_and_is_retried():
+def test_failed_event_wait_does_not_skip_other_banks_and_is_retried():
     reader = make_reader(MagicMock())
     banks = reader._get_dsa_pd_mooncake_staging_banks(2, 2, True)
-    events = [MagicMock() for _ in range(4)]
+    events = [MagicMock() for _ in range(2)]
     events[0].synchronize.side_effect = [RuntimeError("wait failed"), None]
     banks[0].stream.synchronize.side_effect = RuntimeError("stream failed")
-    for bank, pair in zip(banks, [events[:2], events[2:]]):
-        bank.pending_slot_events[:] = pair
+    for bank, event in zip(banks, events):
+        bank.completion_event = event
+        bank.completion_pending = True
     with pytest.raises(RuntimeError, match="wait failed"):
         reader._drain_dsa_pd_mooncake_staging_banks(banks)
     for event in events:
         event.synchronize.assert_called_once()
-    assert banks[0].pending_slot_events == [events[0], None]
-    assert banks[1].pending_slot_events == [None, None]
+    assert banks[0].completion_pending and banks[0].completion_event is events[0]
+    assert not banks[1].completion_pending
     # Retry the failed bank before another request can READ into its staging.
     assert reader._get_dsa_pd_mooncake_staging_banks(2, 2, True) is banks
     assert events[0].synchronize.call_count == 2
-    assert not any(banks[0].pending_slot_events)
+    assert not banks[0].completion_pending
 
 
 def test_failed_cleanup_retains_owners_until_stream_drain_can_finish():
@@ -271,6 +274,25 @@ def test_failed_cleanup_retains_owners_until_stream_drain_can_finish():
     reader._drain_dsa_pd_mooncake_staging_banks((bank,))
     gc.collect()
     assert target_ref() is None and not bank.inflight_owners and not bank.needs_stream_drain
+
+
+def test_failed_event_is_discarded_only_after_successful_stream_drain():
+    reader = make_reader(MagicMock())
+    bank = reader._get_dsa_pd_mooncake_staging_banks(1, 2, True)[0]
+    event = MagicMock()
+    event.synchronize.side_effect = RuntimeError("event failed")
+    bank.completion_event = event
+    bank.completion_pending = True
+    target = torch.empty(16, dtype=torch.int8)
+    target_ref = weakref.ref(target)
+    bank.inflight_owners.append((target,))
+    del target
+    with pytest.raises(RuntimeError, match="event failed"):
+        reader._drain_dsa_pd_mooncake_staging_banks((bank,))
+    bank.stream.synchronize.assert_called_once()
+    gc.collect()
+    assert bank.completion_event is None and not bank.completion_pending
+    assert not bank.inflight_owners and target_ref() is None
 
 
 def test_staging_growth_cannot_drop_an_allocation_that_failed_to_drain(monkeypatch):
@@ -337,7 +359,7 @@ def test_bank_failure_drains_submitted_bytes_before_unlock(monkeypatch, failure)
             reader.batch_transfer_sync_read(*args)
     assert reads == 2
     assert all(not pending for pending in runtime.pending.values())
-    assert all(not any(bank.pending_slot_events) for bank in reader._dsa_pd_mooncake_staging_banks)
+    assert all(not bank.completion_pending for bank in reader._dsa_pd_mooncake_staging_banks)
     assert all(not bank.inflight_owners for bank in reader._dsa_pd_mooncake_staging_banks)
     assert not reader._dsa_pd_mooncake_staging_lock.locked()
     assert torch.count_nonzero(host) > 0
