@@ -35,6 +35,13 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+def _nonnegative_int_env(name: str, default: str = "0") -> int:
+    value = int(os.getenv(name, default))
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    return value
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -107,6 +114,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # chunks per engine call). Any value >= 1 works; banks larger than the
     # window are clamped. This setting is not sensitive.
     "VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS": lambda: max(1, int(os.getenv("VLLM_ASCEND_DSA_PD_MOONCAKE_BANKS", "4"))),
+    # Opt-in Host worker count for staged DSA Mooncake READ -> landing batches.
+    # Default 0 keeps the existing caller-thread serial submission order.
+    # Positive values use a request-scoped thread pool, bounded by active banks;
+    # 1/2/4 allow comparisons with BANKS and STAGING_WINDOW held fixed. One task
+    # at a time owns each bank's slots, stream, events, and cache. Workers set
+    # their NPU device before execution. Requires PIPELINE=1; overlapping bank
+    # destinations and READ_PROBE runs retain serial submission. All workers
+    # join and submitted copies drain before the request lock is released.
+    # Valid: integers >= 0. This setting is not sensitive.
+    "VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS": lambda: _nonnegative_int_env(
+        "VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS"
+    ),
     # Opt-in probe for the staged-read timing blind spot: after each engine
     # batch read returns, a device-wide torch.npu.synchronize() reveals how
     # much later the network data actually becomes visible on the device

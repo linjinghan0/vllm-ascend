@@ -26,3 +26,9 @@ entries:
     text: >-
       Reduced repeated address conversion and alignment calculations while
       splitting DSA Mooncake Host KV transfers into staging slots.
+  - category: feature
+    text: >-
+      Added opt-in DSA Mooncake bank workers through
+      VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS (default 0).
+      Bank count and staging capacity remain independent of the worker count;
+      requests retain ownership until workers join and landing copies drain.

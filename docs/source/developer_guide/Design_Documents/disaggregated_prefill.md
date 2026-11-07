@@ -124,6 +124,24 @@ landing streams and per-slot events, and
 Disabling the pipeline retains the synchronous landing path. These controls
 are independent of the `MooncakeConnectorV2` and ModelRunner V2 names.
 
+`VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS` defaults to `0`, preserving serial
+submission on the caller thread. With the pipeline enabled, positive values
+use a request-scoped Host thread pool, limited to the active bank count.
+Compare `1`, `2`, and `4` workers while keeping `BANKS=4`, the staging window,
+and the payload fixed. Each worker sets its NPU device before executing;
+only one task at a time owns a bank, and READ then copy order stays serial
+within that bank. The worker count does not change the bank streams,
+batch geometry, cache budget, or copy settings.
+
+The request lock remains held until every started worker has joined and
+submitted landing work has drained, including failures. Cross-bank destination
+overlap, a disabled pipeline, and `READ_PROBE=1` use serial submission.
+For overlapping bank destinations, pending landing events drain between
+batches to preserve write dependencies across streams.
+The receive timing line reports `bank_workers`; with workers enabled,
+`read_s` and `land_exposed_s` accumulate worker durations that can overlap,
+so they must not be interpreted as disjoint parts of `total_s`.
+
 #### SFA decode offload with Mooncake pull
 
 `SfaRemoteD2HConnector` also accepts `"transfer_backend": "mooncake"` in

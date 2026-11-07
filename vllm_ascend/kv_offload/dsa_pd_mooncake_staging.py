@@ -6,6 +6,7 @@ import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -471,6 +472,93 @@ class DSAPDMooncakeStagingMixin:
         if first_error is not None:
             raise first_error
 
+    def _execute_dsa_pd_mooncake_bank_workers(
+        self,
+        session_id: str,
+        plan: _DSAPDMooncakeStagingPlan,
+        banks: tuple[_DSAPDMooncakeStagingBank, ...],
+        staging: torch.Tensor,
+        remote_request_id: str,
+        workers: int,
+    ) -> list[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]]:
+        """Dispatch at most one outstanding task per bank under the caller's lock.
+
+        A task keeps READ -> copy order within its bank. Only the coordinator
+        assigns the next batch after that bank's previous future has finished.
+        Device setup is thread-local; the staging allocation and all target
+        validation are complete before the pool starts. The pool is joined on
+        every exit, leaving final stream/event draining to the coordinator.
+        """
+        bank_batches: list[list[_DSAPDMooncakeBankBatch]] = [[] for _ in banks]
+        for batch in plan.batches:
+            bank_batches[batch.bank_index].append(batch)
+        queues = [iter(batches) for batches in bank_batches]
+        stopped = threading.Event()
+        completed = {}
+        failures: dict[int, BaseException] = {}
+        pending: dict[Future, _DSAPDMooncakeBankBatch] = {}
+
+        def execute(batch: _DSAPDMooncakeBankBatch) -> _DSAPDMooncakeBankBatchResult | None:
+            if stopped.is_set():
+                return None
+            try:
+                result = self._execute_dsa_pd_mooncake_bank_batch(
+                    session_id, banks[batch.bank_index], batch, staging, True, remote_request_id
+                )
+            except BaseException:
+                stopped.set()
+                raise
+            if result.return_code < 0:
+                stopped.set()
+            return result
+
+        pool = ThreadPoolExecutor(
+            max_workers=min(workers, len(banks)),
+            thread_name_prefix="dsa-mooncake-bank",
+            initializer=torch.npu.set_device,
+            initargs=(staging.device,),
+        )
+        try:
+            for queue in queues:
+                if stopped.is_set():
+                    break
+                batch = next(queue, None)
+                if batch is not None:
+                    pending[pool.submit(execute, batch)] = batch
+            while pending:
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in sorted(finished, key=lambda value: pending[value].batch_start):
+                    batch = pending.pop(future)
+                    if future.cancelled():
+                        continue
+                    try:
+                        result = future.result()
+                    except BaseException as error:
+                        failures[batch.batch_start] = error
+                        stopped.set()
+                    else:
+                        if result is not None:
+                            completed[batch.batch_start] = (batch, result)
+                    if not stopped.is_set():
+                        following = next(queues[batch.bank_index], None)
+                        if following is not None:
+                            pending[pool.submit(execute, following)] = following
+                if stopped.is_set():
+                    for future in pending:
+                        future.cancel()
+        except BaseException:
+            stopped.set()
+            for future in pending:
+                future.cancel()
+            raise
+        finally:
+            # Running READs are allowed to finish. No bank state is drained or
+            # made available to another request while its host task can use it.
+            pool.shutdown(wait=True, cancel_futures=True)
+        if failures:
+            raise failures[min(failures)]
+        return [completed[index] for index in sorted(completed)]
+
     def _batch_transfer_sync_read_with_optional_staging(
         self,
         session_id: str,
@@ -626,16 +714,46 @@ class DSAPDMooncakeStagingMixin:
         timing_batches = 0
         timing_plan_entries = 0
         timing_copy_calls = 0
+        workers = 0
         try:
             plan = self._prepare_dsa_pd_mooncake_bank_plan(
                 staged_transfers, staged_targets, staging, staging_chunk_bytes, bank_contexts
             )
-            # Keep the original global READ order. C1 only moves ownership and
-            # execution into bank contexts; no worker or second KV stream runs.
-            for batch in plan.batches:
-                result = self._execute_dsa_pd_mooncake_bank_batch(
-                    session_id, bank_contexts[batch.bank_index], batch, staging, pipeline_active, remote_request_id
+            requested_workers = ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS
+            if (
+                requested_workers > 0
+                and pipeline_active
+                and not plan.has_cross_bank_overlap
+                and not ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE
+            ):
+                workers = min(requested_workers, len(bank_contexts))
+            if workers:
+                batch_results = self._execute_dsa_pd_mooncake_bank_workers(
+                    session_id, plan, bank_contexts, staging, remote_request_id, workers
                 )
+            else:
+                # Preserve caller-thread READ order for the original control,
+                # overlapping destinations, and device-wide READ probe runs.
+                def serial_batches() -> Iterator[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]]:
+                    for batch in plan.batches:
+                        if requested_workers > 0 and plan.has_cross_bank_overlap:
+                            # Serial Host submission alone does not order two
+                            # streams writing overlapping destination bytes.
+                            self._drain_dsa_pd_mooncake_staging_banks(bank_contexts)
+                        yield (
+                            batch,
+                            self._execute_dsa_pd_mooncake_bank_batch(
+                                session_id,
+                                bank_contexts[batch.bank_index],
+                                batch,
+                                staging,
+                                pipeline_active,
+                                remote_request_id,
+                            ),
+                        )
+
+                batch_results = serial_batches()
+            for batch, result in batch_results:
                 timing_read_secs += result.read_secs
                 timing_read_settle_secs += result.read_settle_secs
                 timing_land_exposed_secs += result.land_exposed_secs
@@ -651,7 +769,7 @@ class DSAPDMooncakeStagingMixin:
                 timing_land_exposed_secs += time.perf_counter() - drain_started
         logger.info(
             "Staged DSA PD mooncake receive timing: request=%s mode=%s batches=%s chunks=%s "
-            "copies=%s plan=%s total_s=%.3f read_s=%.3f read_settle_s=%.3f land_exposed_s=%.3f",
+            "copies=%s plan=%s total_s=%.3f read_s=%.3f read_settle_s=%.3f land_exposed_s=%.3f bank_workers=%s",
             remote_request_id,
             "pipeline" if pipeline_active else "sync",
             timing_batches,
@@ -662,6 +780,7 @@ class DSAPDMooncakeStagingMixin:
             timing_read_secs,
             timing_read_settle_secs,
             timing_land_exposed_secs,
+            workers,
         )
         return 0
 
