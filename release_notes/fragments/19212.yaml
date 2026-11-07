@@ -22,3 +22,7 @@ entries:
     text: >-
       Reduced CPU work for Mooncake V2 transfer address lists with a single-group
       fast path and bulk construction for fragmented requests.
+  - category: performance
+    text: >-
+      Reduced repeated address conversion and alignment calculations while
+      splitting DSA Mooncake Host KV transfers into staging slots.

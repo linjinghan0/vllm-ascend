@@ -285,16 +285,22 @@ class DSAPDMooncakeStagingMixin:
                 direct_length_list.append(length)
                 continue
             target_tensor, target_offset = resolved
+            local_dst = int(local_dst)
+            remote_src = int(remote_src)
             remaining = int(length)
             offset = 0
+            remote_page_offset = remote_src % staging_alignment
             while remaining > 0:
-                remote_page_offset = (int(remote_src) + offset) % staging_alignment
                 piece_capacity = staging_chunk_bytes - remote_page_offset
                 piece_len = min(remaining, piece_capacity)
-                staged_transfers.append((int(local_dst) + offset, int(remote_src) + offset, piece_len))
-                staged_targets[int(local_dst) + offset] = (target_tensor, target_offset + offset)
+                piece_dst = local_dst + offset
+                staged_transfers.append((piece_dst, remote_src + offset, piece_len))
+                staged_targets[piece_dst] = (target_tensor, target_offset + offset)
                 offset += piece_len
                 remaining -= piece_len
+                # Chunk sizes are alignment multiples. A nonfinal piece fills
+                # its slot, leaving every subsequent source page aligned.
+                remote_page_offset = 0
 
         if direct_src_list:
             ret = self.engine.batch_transfer_sync_read(
