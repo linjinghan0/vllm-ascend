@@ -89,8 +89,8 @@ memory and the direct HBM hot/tail PD reads.
 Configure this combination directly as `MooncakeConnectorV2`. Wrapping it in
 `MultiConnector` is rejected until sparse slot and first-decode hooks are
 forwarded. DSpark's remote prompt/draft-KV protocol is also rejected for this
-combination. A Host-only decode node requires `kv_load_failure_policy="fail"`
-(the default), because it has no device main KV for local prefill recomputation.
-The `keep_device_kv_cache=true` colocate debugging mode retains its local
-recomputation option. These checks do not change the existing SFA connector's
-configuration or flow.
+combination. Decode consumers require `kv_load_failure_policy="fail"` (the
+default) for both Host-only and `keep_device_kv_cache=true` colocate debugging
+modes. Recovery from a failed remote PD transfer to local prefill has not been
+adapted. These checks do not change the existing SFA connector's configuration
+or flow.

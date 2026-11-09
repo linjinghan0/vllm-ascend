@@ -1801,14 +1801,15 @@ class SparseKVOffloadConfig:
                 raise ValueError(
                     "MooncakeConnectorV2 Sparse KV offload has not adapted the DSpark remote prompt protocol"
                 )
+            # Device main KV alone does not reset the failed remote PD handoff.
+            # Require fail until the connector can transition to local prefill.
             if (
                 kv_transfer_config.is_kv_consumer
-                and not self.keep_device_kv_cache
                 and getattr(kv_transfer_config, "kv_load_failure_policy", "fail") != "fail"
             ):
                 raise ValueError(
-                    "MooncakeConnectorV2 Host-only Sparse KV offload requires kv_load_failure_policy='fail'; "
-                    "local prefill recomputation requires keep_device_kv_cache=True"
+                    "MooncakeConnectorV2 Sparse KV offload consumers require kv_load_failure_policy='fail'; "
+                    "failed PD recovery to local prefill is not supported, including keep_device_kv_cache=True"
                 )
             dsa = (getattr(vllm_config, "additional_config", None) or {}).get("dsa_sparse_attention_config", {})
             if dsa.get("enable_cpu_kv_store", False) or dsa.get("tp_shared_host_kv", False):

@@ -3,9 +3,10 @@ entries:
   - category: config
     text: >-
       MooncakeConnectorV2 with Sparse KV offload now rejects unsupported
-      MultiConnector and DSpark combinations at startup. Host-only consumers
-      require the default fail policy instead of local prefill recomputation;
-      the existing SFA connector configuration is unchanged.
+      MultiConnector and DSpark combinations at startup. Consumers require the
+      default fail policy, including keep_device_kv_cache debugging mode, until
+      failed-PD recovery to local prefill is supported. The existing SFA
+      connector configuration is unchanged.
   - category: other
     text: >-
       Centralized DSA Host KV allocation and registered final Host views through

@@ -71,12 +71,32 @@ def test_rejects_multiconnector_without_sparse_handoff_forwarding():
         SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True})
 
 
-def test_host_only_does_not_advertise_local_prefill_recomputation():
+@pytest.mark.parametrize("keep_device_kv_cache", [False, True])
+def test_consumer_rejects_recompute_without_a_failed_pd_recovery_handoff(keep_device_kv_cache):
     cfg = config()
     cfg.kv_transfer_config.kv_load_failure_policy = "recompute"
     with pytest.raises(ValueError, match="kv_load_failure_policy='fail'"):
-        SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True})
-    # Colocate debug retains device main KV and can still recompute locally.
+        SparseKVOffloadConfig.from_additional_config(
+            cfg, {"enabled": True, "keep_device_kv_cache": keep_device_kv_cache}
+        )
+
+
+@pytest.mark.parametrize("keep_device_kv_cache", [False, True])
+@pytest.mark.parametrize("failure_policy", [None, "fail"])
+def test_consumer_accepts_default_and_explicit_fail_policy(keep_device_kv_cache, failure_policy):
+    cfg = config()
+    if failure_policy is not None:
+        cfg.kv_transfer_config.kv_load_failure_policy = failure_policy
+    resolved = SparseKVOffloadConfig.from_additional_config(
+        cfg, {"enabled": True, "keep_device_kv_cache": keep_device_kv_cache}
+    )
+    assert resolved.keep_device_kv_cache == keep_device_kv_cache
+
+
+def test_producer_colocate_debug_does_not_require_a_receive_failure_policy():
+    cfg = config()
+    cfg.kv_transfer_config.is_kv_consumer = False
+    cfg.kv_transfer_config.kv_load_failure_policy = "recompute"
     resolved = SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True, "keep_device_kv_cache": True})
     assert resolved.keep_device_kv_cache
 
