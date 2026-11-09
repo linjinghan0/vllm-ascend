@@ -12,9 +12,9 @@ import torch
 
 _HOST_CACHE_ALIGNMENT = 2 * 1024 * 1024
 _MAX_HOST_COMPONENTS_PER_LAYER = 2
-# SFA's allocator reserves a base-alignment chunk and rounds each component
-# up to a whole chunk. DSA keeps its separate K/V allocation granularity.
-_MAX_ALIGNMENT_OVERHEAD_PER_COMPONENT = 2 * _HOST_CACHE_ALIGNMENT
+# Keep the original DSA allocation contract: each separate K/V component
+# reserves one extra alignment chunk, without rounding up its logical size.
+_MAX_ALIGNMENT_OVERHEAD_PER_COMPONENT = _HOST_CACHE_ALIGNMENT
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -78,7 +78,7 @@ class _DSAPDMooncakeKVRegistry:
         self._pending_offloaded_ranges.clear()
         if getattr(dsa_config, "tp_shared_host_kv", False):
             # Include device-only groups as before, plus the worst-case padding
-            # of SFA's aligned allocator for each separately allocated component.
+            # of DSA's original allocator for each separately allocated component.
             capacity = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
             capacity += num_layers * _MAX_HOST_COMPONENTS_PER_LAYER * _MAX_ALIGNMENT_OVERHEAD_PER_COMPONENT
             self.initialize_shared_host_pool(vllm_config, capacity)

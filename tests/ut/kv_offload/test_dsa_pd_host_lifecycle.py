@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared allocation and final-view contracts used by the DSA V2 runner."""
+"""Original DSA allocation and final-view contracts used by the V2 runner."""
 
 import ctypes
 import gc
@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import sparse_kv_offload_manager as sfa
 from vllm_ascend.kv_offload import dsa_pd_mooncake as dsa
 from vllm_ascend.kv_offload.dsa_pd_shared_host import DSAPDSharedHostPool
 
@@ -19,8 +18,7 @@ def make_shared_pool(rank=0, *, capacity=1 << 20, shared=None):
     """Use real CPU storage in place of memfabric's imported device storage."""
     shared = {} if shared is None else shared
 
-    def empty(shape, *, dtype, pin_memory):
-        assert pin_memory is True
+    def empty(shape, *, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
         shared[tensor.data_ptr()] = tensor.untyped_storage()
         return tensor
@@ -47,22 +45,17 @@ def make_shared_pool(rank=0, *, capacity=1 << 20, shared=None):
 
 
 @pytest.mark.parametrize("size", [1, 64, 65, 4095, 4096, 4097])
-def test_tp_owner_calls_real_sfa_allocator_and_all_ranks_borrow_the_same_view(size):
+def test_tp_owner_keeps_original_allocation_and_all_ranks_borrow_the_same_view(size):
     shared = {}
     owner = make_shared_pool(shared=shared)
     borrower = make_shared_pool(rank=1, shared=shared)
-    original = sfa.empty_aligned_int8_cpu_tensors
-    with (
-        patch.object(sfa, "offload", owner._offload, create=True),
-        patch.object(sfa, "empty_aligned_int8_cpu_tensors", wraps=original) as allocate,
-    ):
-        first = owner.allocate(size, 64)
-        second = borrower.allocate(size, 64)
-    allocate.assert_called_once_with([size], 64)
-    needed = (1 + (size + 63) // 64) * 64
-    owner._offload.empty.assert_called_once_with([needed], dtype=torch.int8, pin_memory=True)
+    first = owner.allocate(size, 64)
+    second = borrower.allocate(size, 64)
+    needed = size + 64
+    owner._offload.empty.assert_called_once_with([needed], dtype=torch.int8)
     borrower._offload.empty.assert_not_called()
-    assert first.data_ptr() == second.data_ptr() == owner._owners[0].data_ptr()
+    assert first.data_ptr() == second.data_ptr()
+    assert owner._owners[0].data_ptr() <= first.data_ptr() < owner._owners[0].data_ptr() + 64
     assert first.numel() == second.numel() == size
     assert first.data_ptr() % 64 == 0
     assert owner._allocated == borrower._allocated == needed
@@ -78,18 +71,18 @@ def test_padding_capacity_is_checked_before_allocating_or_broadcasting():
     pool = make_shared_pool(capacity=128)
     pool.group = MagicMock()
     with pytest.raises(ValueError, match="planned capacity"):
-        pool.allocate(65, 64)  # SFA needs 192 bytes, rather than the previous 129.
+        pool.allocate(65, 64)  # The original DSA allocation needs 129 bytes.
     pool._offload.empty.assert_not_called()
     pool.group.broadcast.assert_not_called()
 
 
-def test_initialization_budget_covers_two_sfa_allocations_per_layer():
+def test_initialization_budget_keeps_original_alignment_reserve_per_layer():
     registry = dsa._DSAPDMooncakeKVRegistry()
     config = SimpleNamespace(additional_config={"dsa_sparse_attention_config": {"shared_host_store_port": 8651}})
     cache = SimpleNamespace(kv_cache_tensors=[SimpleNamespace(size=1), SimpleNamespace(size=3)])
     with patch("vllm_ascend.kv_offload.dsa_pd_shared_host.DSAPDSharedHostPool") as pool:
         registry.initialize(config, cache, SimpleNamespace(mode="fused_overlap", tp_shared_host_kv=True), num_layers=2)
-    pool.assert_called_once_with(config, 4 + 2 * 2 * 2 * (2 << 20), 8651)
+    pool.assert_called_once_with(config, 4 + 2 * 2 * (2 << 20), 8651)
     with pytest.raises(RuntimeError, match="reinitialized"):
         registry.initialize_shared_host_pool(config, 1 << 30)
 
@@ -98,8 +91,7 @@ def test_staging_lands_in_the_registered_compute_view_and_keeps_indexer_local():
     pool = make_shared_pool()
     registry = dsa._DSAPDMooncakeKVRegistry()
     registry.shared_host_pool = pool
-    with patch.object(sfa, "offload", pool._offload, create=True):
-        raw = registry.allocate(32, 64)
+    raw = registry.allocate(32, 64)
     main = raw.view(torch.bfloat16).reshape(2, 8)
     indexer = torch.arange(8, dtype=torch.int8)
     before = indexer.clone()
@@ -108,7 +100,8 @@ def test_staging_lands_in_the_registered_compute_view_and_keeps_indexer_local():
     targets = registry.create_transfer_targets([[main], [indexer]])
     assert targets is not None and targets[0][0].offloaded and not targets[1][0].offloaded
     prepared = registry.prepare_transfer_targets([targets[0][0]], [main.data_ptr()], [32])
-    assert prepared[0][0].data_ptr() == main.data_ptr() == pool._owners[0].data_ptr()
+    assert prepared[0][0].data_ptr() == main.data_ptr()
+    assert pool._owners[0].data_ptr() <= main.data_ptr() < pool._owners[0].data_ptr() + 64
 
     def sparse_copy(sources, destinations, lengths, _count, _device):
         for source, destination, length in zip(sources.tolist(), destinations.tolist(), lengths.tolist()):

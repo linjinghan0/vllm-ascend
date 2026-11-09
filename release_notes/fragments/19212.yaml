@@ -1,9 +1,10 @@
 pr: 19212
 entries:
-  - category: performance
+  - category: other
     text: >-
-      Reused SFA's aligned Host allocation for TP-shared DSA KV and registered
-      final Host views through the V2 runner's pre-connector cache lifecycle.
+      Centralized DSA Host KV allocation and registered final Host views through
+      the V2 runner's pre-connector cache lifecycle, preserving the existing
+      Host allocation sizes and alignment budget.
   - category: performance
     text: >-
       Reused TP-shared Host KV block ownership plans across layers and KV
