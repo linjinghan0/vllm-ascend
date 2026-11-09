@@ -36,14 +36,22 @@ placed densely in the reserved hot row; a long prefix's incomplete last block
 is placed at `hot_tokens + (logical_block % 2) * block_size` in the existing
 two-block circular tail. An aligned long prefix requires no tail READ. These
 HBM reads are replicated on every D TP rank, independently of shared Host block
-ownership. The valid prefix ends before the last prompt token replayed by V2.
+ownership. Like the existing SFA scheduler, placement uses the entire received
+KV extent (`computed + external`, bounded by the producer's valid KV count),
+without subtracting a replayed prompt token. A producer-generated token appended
+to D's input is not part of the producer's prompt KV.
 
 The existing V2 batch READ and bounded staging pipeline still land Host main
 KV through the SFA manager's local-copy API. Receive completion includes both
 direct HBM reads and the final Host staging drain. After all TP workers complete
-PD, the first real decode validates the reservation and prefix and does not
-repeat Host-to-hot initialization. Complete local prefix hits with no remote
-PD and prefix rollback retain the existing local recovery path.
+PD, the first real decode validates the reservation and expected execution
+prefix. The scheduler may replay the last prompt token; this does not change
+PD placement. If a long received extent is block-aligned and its last token is
+replayed, PD has no incomplete tail but that forward needs the preceding
+partial block. The V2 adapter restores that history once through the existing
+manager tail-copy API before eager execution or graph replay. Other remote
+receives do not repeat Host-to-hot initialization. Complete local prefix hits
+with no remote PD and prefix rollback retain the existing local recovery path.
 
 This adaptation changes only the V2 path. The existing SFA connector, transfer
 flow, allocation and attention operators are unchanged; no shared PD path is

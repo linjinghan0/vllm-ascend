@@ -20,6 +20,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import (
     MooncakePullRecvingThread,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import CopySfaTailDest
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import SFAPDRD2HScheduler
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import sparse_kv_offload_manager as manager_module
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
     CopySfaTopkSlotAllocator,
@@ -327,9 +328,41 @@ def test_early_mrv2_metadata_preparation_is_idempotent_with_late_start_load():
     worker._recving_thread.add_requests.assert_not_called()
 
 
+def sfa_prefill_destination(tokens, blocks, slot):
+    """Use the unchanged SFA scheduler, not a separately chosen test prefix."""
+    scheduler = SFAPDRD2HScheduler.__new__(SFAPDRD2HScheduler)
+    scheduler.main_group_idx, scheduler.indexer_group_idx = 1, 0
+    scheduler.engine_id, scheduler.side_channel_host, scheduler.side_channel_port = "d", "host", 9
+    scheduler.block_size, scheduler.main_block_size = [128, 128], 128
+    scheduler.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
+        )
+    )
+    scheduler._request_trackers, scheduler._copy_sfa_bindings = {}, {}
+    scheduler._reqs_need_recv, scheduler._dspark_context_groups = set(), ()
+    scheduler._copy_sfa_hot_tokens = 2048
+    scheduler._copy_sfa_slot_allocator = CopySfaTopkSlotAllocator(4)
+    for i in range(slot):
+        scheduler._copy_sfa_slot_allocator.bind("occupied-" + str(i))
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_computed_tokens=0,
+        prompt_token_ids=list(range(tokens)),
+        kv_transfer_params={"do_remote_prefill": True, "do_virtual": True},
+    )
+    allocation = MagicMock()
+    allocation.get_block_ids.return_value = ([], blocks)
+    scheduler.update_state_after_alloc(request, allocation, num_external_tokens=tokens)
+    meta = scheduler.build_connector_meta(MagicMock()).requests[0]
+    assert meta.kv_tokens == tokens and meta.pool_slot == slot
+    return CopySfaTailDest(meta.pool_slot, meta.tail_tokens, meta.tail_block_index, meta.dense, meta.kv_tokens)
+
+
 @pytest.mark.parametrize("tokens", [0, 1, 127, 128, 129, 2047, 2048, 2049, 2176, 2177, 2303, 2304, 4095, 4096, 4097])
 @pytest.mark.parametrize("tp_size", [1, 2, 8])
-def test_direct_hbm_reads_match_unchanged_sfa_dense_and_circular_tail(tokens, tp_size):
+@pytest.mark.parametrize("continuation", [False, True])
+def test_direct_hbm_reads_match_unchanged_sfa_dense_and_circular_tail(tokens, tp_size, continuation):
     blocks = list(range(8, 16)) + list(range(8)) + list(range(16, 40))
     for rank in range(tp_size):
         manager, caches = make_manager(rank=rank, size=tp_size, blocks=40)
@@ -338,16 +371,16 @@ def test_direct_hbm_reads_match_unchanged_sfa_dense_and_circular_tail(tokens, tp
         request = SimpleNamespace(
             copy_sfa_slot=3,
             num_computed_tokens=0,
-            num_external_tokens=tokens + 1,
-            local_num_prompt_tokens=tokens + 1,
-            remote_num_prompt_tokens=tokens + 1,
+            num_external_tokens=tokens + int(continuation),
+            local_num_prompt_tokens=tokens + int(continuation),
+            remote_num_prompt_tokens=tokens,
             remote_block_ids=([], blocks),
         )
         local, peer, lengths, targets = [], [], [], []
         host.append_prefill_reads(MAIN, request, (1000, 2000), (1024, 512), (1024, 512), local, peer, lengths, targets)
         thread = _make_tail_read_thread(tp_rank=rank, tp_size=tp_size)
         dense, tail_tokens, tail_block = copy_sfa_prefill_dest_geometry(tokens, 128, 2048)
-        thread._state.copy_sfa_tail_by_req["req-0"] = CopySfaTailDest(3, tail_tokens, tail_block, dense, tokens)
+        thread._state.copy_sfa_tail_by_req["req-0"] = sfa_prefill_destination(tokens, blocks, 3)
         thread._state.dest_blocks_by_req["req-0"] = (list(range(40)), [])
         thread._state.topk_k_bases = [pair[0].data_ptr()]
         thread._state.topk_v_bases = [pair[1].data_ptr()]
@@ -364,7 +397,7 @@ def test_direct_hbm_reads_match_unchanged_sfa_dense_and_circular_tail(tokens, tp
         assert sum(lengths) == (tokens if dense else tail_tokens) * 12
 
 
-@pytest.mark.parametrize("tokens", [129, 2049, 2177, 4097])
+@pytest.mark.parametrize("tokens", [128, 2048, 2049, 2175, 2176, 2177, 2304, 4096, 4097])
 @pytest.mark.parametrize("pipeline", [False, True])
 @pytest.mark.parametrize("rank,size", [(0, 1), (7, 8)])
 @pytest.mark.parametrize("fail_direct", [False, True])
@@ -400,9 +433,9 @@ def test_real_bucket_direct_hbm_and_host_landing_share_completion(tokens, pipeli
     request = SimpleNamespace(
         copy_sfa_slot=2,
         num_computed_tokens=0,
-        num_external_tokens=tokens + 1,
-        local_num_prompt_tokens=tokens + 1,
-        remote_num_prompt_tokens=tokens + 1,
+        num_external_tokens=tokens,
+        local_num_prompt_tokens=tokens,
+        remote_num_prompt_tokens=tokens,
         remote_block_ids=([], blocks),
     )
     thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
@@ -437,7 +470,7 @@ def test_real_bucket_direct_hbm_and_host_landing_share_completion(tokens, pipeli
     for source, hot in zip((source_k, source_v), host.hot_caches[MAIN]):
         expected = source[blocks].reshape(-1, 1, source.shape[-1])[:tokens]
         if not dense:
-            expected = expected[-tail:]
+            expected = expected[-tail:] if tail else expected[:0]
         assert torch.equal(hot[2, start : start + length], expected)
         assert not torch.count_nonzero(hot[:2])
         assert not torch.count_nonzero(hot[3:])
@@ -475,7 +508,7 @@ def test_partial_local_prefix_still_primes_whole_dense_row_from_producer():
     local, peer, lengths = [], [], []
     host.append_prefill_reads(MAIN, req, (1000, 2000), (1024, 512), (1024, 512), local, peer, lengths)
     assert peer[0] == 1000 + 5 * 1024
-    assert sum(lengths) == 200 * 12
+    assert sum(lengths) == 201 * 12
 
 
 @pytest.mark.parametrize("slot", [None, -1, 4])
@@ -513,3 +546,34 @@ def test_cancelled_pd_holds_hot_row_until_all_receivers_finish(failed):
     )
     assert not scheduler._copy_sfa_deferred_releases
     assert scheduler._copy_sfa_slot_allocator.bind("next") == 0
+
+
+@pytest.mark.parametrize("tokens", [1, 128, 129, 2048, 2049, 2175, 2176, 2177, 2304, 2305, 4096, 4097])
+@pytest.mark.parametrize("replay", [False, True])
+def test_received_extent_and_first_execution_prefix_have_separate_lifetimes(tokens, replay):
+    state = MooncakeSFAPDState(1)
+    computed = tokens - int(replay)
+    state.update({"r": 0}, ["r"], {"r": computed}, {"r": tokens})
+    state.record_received({"r"}, set())
+    restore, dense, initialized = state.prepare(["r"], [0], [computed], block_size=128, hot_tokens=2048)
+    assert restore == (replay and tokens > 2048 and tokens % 128 == 0)
+    assert dense == {} and initialized == {"r"}
+    state.commit(initialized)
+    assert not state.remote_prefill_tokens and not state.remote_prefixes
+    assert state.prepare(["r"], [0], [computed + 1], block_size=128, hot_tokens=2048) == (False, {}, set())
+    state.update({"cancelled": 0}, ["cancelled"], {"cancelled": 2175}, {"cancelled": 2176})
+    state.update({}, [])
+    assert not state.remote_prefill_tokens and not state.remote_prefixes
+
+
+def test_worker_keeps_producer_extent_separate_from_continuation_input():
+    worker = MooncakePullConnectorWorker.__new__(MooncakePullConnectorWorker)
+    worker._sfa_pd_state = MooncakeSFAPDState(1)
+    meta = MooncakeConnectorMetadata()
+    meta.copy_sfa_slots = {"r": 0}
+    meta.requests["r"] = SimpleNamespace(
+        num_computed_tokens=0, num_external_tokens=2177, local_num_prompt_tokens=2177, remote_num_prompt_tokens=2176
+    )
+    worker.prepare_sparse_kv_offload(meta)
+    assert worker._sfa_pd_state.remote_prefill_tokens == {"r": 2176}
+    assert worker._sfa_pd_state.remote_prefixes == {"r": 2176}

@@ -101,10 +101,9 @@ class MooncakeSFAHostKV:
         pair = self.hot_caches[layer_name]
         if not 0 <= slot < pair[0].shape[0]:
             raise ValueError("Mooncake V2 SFA PD hot row is out of bounds")
-        # V2 replays the last prompt token after a complete remote hit.
-        # Prime the prefix before that token, exactly as the first D forward
-        # sees it; using the P prompt length shifts the circular-tail boundary.
-        kv_tokens = min(request.num_computed_tokens + request.num_external_tokens, request.local_num_prompt_tokens - 1)
+        # Match the SFA scheduler's finished-prefill extent. The scheduler's
+        # subsequent last-token replay does not shorten the received KV.
+        kv_tokens = min(request.num_computed_tokens + request.num_external_tokens, request.remote_num_prompt_tokens)
         if not 0 <= kv_tokens <= min(request.local_num_prompt_tokens, request.remote_num_prompt_tokens):
             raise ValueError("Mooncake V2 SFA PD prefix exceeds the available producer KV")
         dense, tail_tokens, tail_block = copy_sfa_prefill_dest_geometry(kv_tokens, self.block_size, self.hot_tokens)
@@ -204,9 +203,14 @@ class MooncakeSFAPDState:
         self.received: set[str] = set()
         self.remote: set[str] = set()
         self.remote_prefixes: dict[str, int] = {}
+        self.remote_prefill_tokens: dict[str, int] = {}
 
     def update(
-        self, bindings: dict[str, int], new_requests: Sequence[str], remote_prefixes: dict[str, int] | None = None
+        self,
+        bindings: dict[str, int],
+        new_requests: Sequence[str],
+        remote_prefixes: dict[str, int] | None = None,
+        remote_prefill_tokens: dict[str, int] | None = None,
     ) -> None:
         if len(set(bindings.values())) != len(bindings):
             raise ValueError("Mooncake V2 SFA requests cannot share a hot row")
@@ -223,6 +227,10 @@ class MooncakeSFAPDState:
         self.remote.update(new_requests)
         self.remote_prefixes = {req: count for req, count in self.remote_prefixes.items() if req in bindings}
         self.remote_prefixes.update(remote_prefixes or {})
+        self.remote_prefill_tokens = {
+            req: count for req, count in self.remote_prefill_tokens.items() if req in bindings
+        }
+        self.remote_prefill_tokens.update(remote_prefill_tokens or {})
         self.pending.update(newly_bound | set(new_requests))
         # A complete local prefix hit needs no READ, but its new hot row still
         # needs initialization from the retained Host blocks before decoding.
@@ -258,8 +266,12 @@ class MooncakeSFAPDState:
             if req_id in self.remote:
                 if computed != self.remote_prefixes.get(req_id, computed):
                     raise RuntimeError("Mooncake V2 SFA first decode prefix differs from the received hot/tail prefix")
-                # Receive completion includes direct HBM dense/tail READs and
-                # the shared Host staging drain. No first-decode H2D is needed.
+                # SFA prefill placement uses the received extent, independently
+                # of V2's first-forward replay prefix. An aligned long prefill
+                # has no PD tail, but replaying its last token needs the previous
+                # block's history. Reuse the existing tail-restore API once.
+                prefilled = self.remote_prefill_tokens.get(req_id, computed)
+                restore_tails |= prefilled > hot_tokens and prefilled % block_size == 0 and computed == prefilled - 1
                 initialized.add(req_id)
                 continue
             dense, tail_tokens, _ = copy_sfa_prefill_dest_geometry(computed, block_size, hot_tokens)
@@ -275,3 +287,4 @@ class MooncakeSFAPDState:
         self.remote.difference_update(initialized)
         for req_id in initialized:
             self.remote_prefixes.pop(req_id, None)
+            self.remote_prefill_tokens.pop(req_id, None)

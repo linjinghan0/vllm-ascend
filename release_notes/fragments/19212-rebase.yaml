@@ -12,3 +12,5 @@ entries:
     text: Connected MooncakeConnectorV2 with ModelRunner V2 to the existing SFA Host KV manager and LIM + Copy-SFA backend, preserving pipelined Host landing and directly priming rank-local HBM hot rows and circular tails during PD, without changing the existing SFA connector flow.
   - category: bugfix
     text: Used the native int32 byte-length ABI for SFA dense hot-row initialization while retaining int64 source and destination offsets.
+  - category: bugfix
+    text: Matched Mooncake V2 hot-row and circular-tail PD initialization to SFA's full received KV extent, while separately restoring history for last-token replay across a block-aligned long prefill.

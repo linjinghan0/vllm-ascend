@@ -512,8 +512,8 @@ class AscendModelState(DefaultModelState):
                 pd_state = getter() if getter is not None else None
                 if pd_state is not None:
                     # Remote completion includes both Host landing and direct
-                    # HBM hot/tail reads. Only a complete local prefix hit with
-                    # no remote PD needs local row initialization here.
+                    # HBM hot/tail reads. Local hits and a last-token replay
+                    # across an aligned PD extent may need local restoration.
                     pd_restore_tails, pd_dense_fills, pd_initialized = pd_state.prepare(
                         input_batch.req_ids[: input_batch.num_reqs],
                         pool_slots.np,

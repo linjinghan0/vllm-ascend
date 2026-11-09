@@ -1822,6 +1822,10 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
                     req_id: min(req.num_computed_tokens + req.num_external_tokens, req.local_num_prompt_tokens - 1)
                     for req_id, req in metadata.requests.items()
                 },
+                {
+                    req_id: min(req.num_computed_tokens + req.num_external_tokens, req.remote_num_prompt_tokens)
+                    for req_id, req in metadata.requests.items()
+                },
             )
             self._sfa_metadata = metadata
 

@@ -14,12 +14,12 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import Mo
 from vllm_ascend.worker.v2.model_states import default
 
 
-@pytest.mark.parametrize("computed", [128, 2048, 2049, 2176])
+@pytest.mark.parametrize("computed", [127, 128, 2047, 2048, 2049, 2175, 2176, 2303, 4095])
 @pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
 @pytest.mark.parametrize("local_hit", [False, True])
 def test_first_real_decode_primes_correct_group_before_graph_or_eager_forward(monkeypatch, computed, mode, local_hit):
     pd = MooncakeSFAPDState(main_group_id=1)
-    pd.update({"r": 2}, [] if local_hit else ["r"])
+    pd.update({"r": 2}, [] if local_hit else ["r"], {"r": computed}, {"r": computed + 1})
     pd.record_received({"r"}, set())
     cfg = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=128),
@@ -72,8 +72,12 @@ def test_first_real_decode_primes_correct_group_before_graph_or_eager_forward(mo
 
     monkeypatch.setattr(default, "build_attn_metadata", build)
     tables = (torch.tensor([[1, 2]]), torch.tensor([[7, 8]]))
-    if local_hit and (computed <= 2048 or computed % 128):
-        operation = manager.dense_fill_copy_sfa_rows if computed <= 2048 else manager.restore_copy_sfa_tails
+    needs_dense = local_hit and computed <= 2048
+    needs_tail = (local_hit and computed > 2048 and computed % 128 != 0) or (
+        not local_hit and computed + 1 > 2048 and (computed + 1) % 128 == 0
+    )
+    if needs_dense or needs_tail:
+        operation = manager.dense_fill_copy_sfa_rows if needs_dense else manager.restore_copy_sfa_tails
         operation.side_effect = RuntimeError("initial copy failed")
         with pytest.raises(RuntimeError, match="initial copy failed"):
             state.prepare_attn(batch, mode, tables, torch.empty(0), [], None)
@@ -89,7 +93,7 @@ def test_first_real_decode_primes_correct_group_before_graph_or_eager_forward(mo
         assert args.kwargs["block_table"] is tables[1]
     else:
         manager.dense_fill_copy_sfa_rows.assert_not_called()
-    assert manager.restore_copy_sfa_tails.call_count == int(local_hit and computed > 2048 and computed % 128 != 0)
+    assert manager.restore_copy_sfa_tails.call_count == int(needs_tail)
     before = (manager.dense_fill_copy_sfa_rows.call_count, manager.restore_copy_sfa_tails.call_count)
     state.prepare_attn(batch, mode, tables, torch.empty(0), [], None)
     assert before == (manager.dense_fill_copy_sfa_rows.call_count, manager.restore_copy_sfa_tails.call_count)
