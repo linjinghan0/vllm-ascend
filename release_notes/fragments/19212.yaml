@@ -2,6 +2,10 @@ pr: 19212
 entries:
   - category: performance
     text: >-
+      Reused SFA's aligned Host allocation for TP-shared DSA KV and registered
+      final Host views through the V2 runner's pre-connector cache lifecycle.
+  - category: performance
+    text: >-
       Reused TP-shared Host KV block ownership plans across layers and KV
       components within each Mooncake pull spec call, and built block groups
       only for the required coalescing modes.

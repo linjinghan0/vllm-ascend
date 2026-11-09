@@ -10,6 +10,12 @@ from typing import Any
 
 import torch
 
+_HOST_CACHE_ALIGNMENT = 2 * 1024 * 1024
+_MAX_HOST_COMPONENTS_PER_LAYER = 2
+# SFA's allocator reserves a base-alignment chunk and rounds each component
+# up to a whole chunk. DSA keeps its separate K/V allocation granularity.
+_MAX_ALIGNMENT_OVERHEAD_PER_COMPONENT = 2 * _HOST_CACHE_ALIGNMENT
+
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.element_size() * tensor.numel())
@@ -43,7 +49,9 @@ class _DSAPDMooncakeKVRegistry:
 
     Tensor references are weak so reinitializing a model runner cannot keep an
     obsolete KV cache alive. Registration happens during startup; connector
-    threads only read the registry after initialization.
+    threads only read the registry after initialization. The same worker-local
+    object tracks allocation and publishes final views through register_kv_caches,
+    matching the SFA initialization lifecycle without owning its decode state.
     """
 
     def __init__(self) -> None:
@@ -57,6 +65,89 @@ class _DSAPDMooncakeKVRegistry:
         # One cache allocation per worker process. Retain shared backing for
         # its full lifetime, including borrowed NPU views and connector copies.
         self.shared_host_pool = None
+        self._pending_offloaded_ranges: list[tuple[int, int]] = []
+
+    @property
+    def has_pending_allocations(self) -> bool:
+        return bool(self._pending_offloaded_ranges)
+
+    def initialize(self, vllm_config: Any, kv_cache_config: Any, dsa_config: Any, *, num_layers: int) -> None:
+        """Prepare the existing worker registry before any raw KV allocation."""
+        if getattr(dsa_config, "mode", None) == "fused_overlap":
+            self.clear()
+        self._pending_offloaded_ranges.clear()
+        if getattr(dsa_config, "tp_shared_host_kv", False):
+            # Include device-only groups as before, plus the worst-case padding
+            # of SFA's aligned allocator for each separately allocated component.
+            capacity = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+            capacity += num_layers * _MAX_HOST_COMPONENTS_PER_LAYER * _MAX_ALIGNMENT_OVERHEAD_PER_COMPONENT
+            self.initialize_shared_host_pool(vllm_config, capacity)
+
+    def initialize_shared_host_pool(self, vllm_config: Any, capacity_bytes: int) -> None:
+        from vllm_ascend.kv_offload.dsa_pd_shared_host import DSAPDSharedHostPool
+
+        if self.shared_host_pool is not None:
+            raise RuntimeError("DSA shared Host backing cannot be reinitialized in a live worker")
+        config = _get_dsa_sparse_attention_config(vllm_config)
+        port = int(_config_get(config, "shared_host_store_port", 8650))
+        self.shared_host_pool = DSAPDSharedHostPool(vllm_config, capacity_bytes, port)
+
+    def allocate(self, tensor_size: int, alignment: int) -> torch.Tensor:
+        """Allocate Host backing and remember the range awaiting final reshape."""
+        if tensor_size <= 0 or alignment <= 0:
+            raise ValueError("DSA Host KV size and alignment must be positive")
+        if self.shared_host_pool is not None:
+            tensor = self.shared_host_pool.allocate(tensor_size, alignment)
+        else:
+            raw = empty_mooncake_cpu_kv_memory((tensor_size + alignment,), dtype=torch.int8)
+            offset = (-raw.data_ptr()) % alignment
+            tensor = raw[offset : offset + tensor_size]
+        if tensor.data_ptr() % alignment or tensor.numel() != tensor_size:
+            raise RuntimeError("DSA PD Mooncake offloaded KV allocation is not correctly aligned and sized")
+        # Include all backing padding so the connector cannot classify it as HBM.
+        storage = tensor.untyped_storage()
+        self.register_cpu_buffer(int(storage.data_ptr()), int(storage.nbytes()))
+        self._pending_offloaded_ranges.append((int(tensor.data_ptr()), int(tensor.numel())))
+        return tensor
+
+    def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+        """Bind final compute views before the connector publishes its targets.
+
+        Validate the complete layout before publishing any view. Only tensors
+        inside this allocation's Host ranges are registered; indexer HBM and
+        other runtime state keep their existing storage and target semantics.
+        """
+        pending = self._pending_offloaded_ranges
+        if not pending:
+            return
+        matched: set[int] = set()
+        tensors: list[torch.Tensor] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, torch.Tensor):
+                ptr, size = int(value.data_ptr()), _tensor_nbytes(value)
+                for index, (start, length) in enumerate(pending):
+                    if ptr >= start and ptr + size <= start + length:
+                        if self.shared_host_pool is not None and value.dtype != torch.bfloat16:
+                            raise ValueError("DSA TP-shared Host KV requires BF16 main cache views")
+                        tensors.append(value)
+                        matched.add(index)
+                        return
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+
+        collect(kv_caches)
+        if len(matched) != len(pending):
+            raise RuntimeError(
+                "Failed to bind all DSA PD Mooncake offloaded KV allocations to final runtime tensor views."
+            )
+        for tensor in tensors:
+            self.register_offloaded_tensor(tensor)
+        pending.clear()
 
     def register_cpu_buffer(self, ptr: int, size: int) -> None:
         if ptr <= 0 or size <= 0:
@@ -165,6 +256,7 @@ class _DSAPDMooncakeKVRegistry:
 
     def clear(self) -> None:
         with self._lock:
+            self._pending_offloaded_ranges.clear()
             self._cpu_buffers.clear()
             self._offloaded_tensors.clear()
             self._offloaded_byte_views.clear()
@@ -248,6 +340,11 @@ class _DSAPDMooncakeKVRegistry:
 
 
 _DSA_PD_MOONCAKE_KV_REGISTRY = _DSAPDMooncakeKVRegistry()
+
+
+def get_dsa_pd_mooncake_kv_registry() -> _DSAPDMooncakeKVRegistry:
+    """Return the worker's existing allocation and final-view registration owner."""
+    return _DSA_PD_MOONCAKE_KV_REGISTRY
 
 
 def create_dsa_pd_mooncake_transfer_targets(
@@ -418,10 +515,4 @@ def get_dsa_pd_shared_host_pool():
 
 
 def initialize_dsa_pd_shared_host_pool(vllm_config: Any, capacity_bytes: int) -> None:
-    from vllm_ascend.kv_offload.dsa_pd_shared_host import DSAPDSharedHostPool
-
-    if _DSA_PD_MOONCAKE_KV_REGISTRY.shared_host_pool is not None:
-        raise RuntimeError("DSA shared Host backing cannot be reinitialized in a live worker")
-    config = _get_dsa_sparse_attention_config(vllm_config)
-    port = int(_config_get(config, "shared_host_store_port", 8650))
-    _DSA_PD_MOONCAKE_KV_REGISTRY.shared_host_pool = DSAPDSharedHostPool(vllm_config, capacity_bytes, port)
+    _DSA_PD_MOONCAKE_KV_REGISTRY.initialize_shared_host_pool(vllm_config, capacity_bytes)

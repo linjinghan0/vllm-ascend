@@ -136,12 +136,24 @@ class DSAPDSharedHostPool:
     def allocate(self, size: int, alignment: int) -> torch.Tensor:
         import torch
 
-        needed = size + alignment
-        if size <= 0 or alignment <= 0 or self._allocated + needed > self.capacity:
+        if size <= 0 or alignment <= 0:
+            raise ValueError("DSA shared Host size and alignment must be positive")
+        # Reuse SFA's allocator unchanged, one component at a time. It reserves
+        # one base-alignment chunk plus the rounded-up component size.
+        needed = (1 + (size + alignment - 1) // alignment) * alignment
+        if self._allocated + needed > self.capacity:
             raise ValueError("DSA shared Host allocation exceeds its planned capacity")
-        host = self._offload.empty([needed], dtype=torch.int8) if self.rank == 0 else None
-        ptr = 0 if host is None else host.data_ptr()
-        base = torch.tensor([ptr, needed], dtype=torch.int64, device=self.device)
+        host = None
+        if self.rank == 0:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                empty_aligned_int8_cpu_tensors,
+            )
+
+            [host] = empty_aligned_int8_cpu_tensors([size], alignment)
+        storage = None if host is None else host.untyped_storage()
+        ptr = 0 if storage is None else storage.data_ptr()
+        extent = needed if storage is None else storage.nbytes()
+        base = torch.tensor([ptr, extent], dtype=torch.int64, device=self.device)
         self.group.broadcast(base, src=0)
         shared_ptr, actual_size = map(int, base.cpu().tolist())
         if shared_ptr <= 0 or actual_size != needed:
@@ -152,6 +164,8 @@ class DSAPDSharedHostPool:
         raw = torch.empty(0, dtype=torch.int8, device=self.device).set_(storage, 0, (needed,), (1,))
         offset = (-shared_ptr) % alignment
         view = raw[offset : offset + size]
+        if host is not None and view.data_ptr() != host.data_ptr():
+            raise RuntimeError("DSA shared view differs from the SFA Host allocation")
         self._register_range(view.data_ptr(), size)
         if host is not None:
             self._owners.append(host)

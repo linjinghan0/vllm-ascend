@@ -16,10 +16,8 @@ from vllm_ascend.worker.v2 import attn_utils
 @pytest.fixture(autouse=True)
 def clear_host_registry():
     registry.reset_dsa_pd_mooncake_kv_registries()
-    attn_utils._dsa_pd_mooncake_pending_offloaded_ranges.clear()
     yield
     registry.reset_dsa_pd_mooncake_kv_registries()
-    attn_utils._dsa_pd_mooncake_pending_offloaded_ranges.clear()
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -91,7 +89,7 @@ def test_sfa_main_host_allocation_and_final_view_registration(monkeypatch, packe
         swapped_storage.append(tensor)
         return tensor
 
-    with patch.object(attn_utils, "empty_mooncake_cpu_kv_memory", side_effect=swapped) as allocator:
+    with patch.object(registry, "empty_mooncake_cpu_kv_memory", side_effect=swapped) as allocator:
         raw = attn_utils._allocate_kv_cache(kv_config, shared_layers={}, device=torch.device("cpu"))
     expected = scenario == "host"
     assert allocator.call_count == ((1 if packed else 2) if expected else 0)
@@ -107,7 +105,7 @@ def test_sfa_main_host_allocation_and_final_view_registration(monkeypatch, packe
         shared_kv_cache_layers={},
         kv_cache_config=kv_config,
     )
-    attn_utils._register_dsa_pd_mooncake_final_kv_views(caches)
+    registry.get_dsa_pd_mooncake_kv_registry().register_kv_caches(caches)
     main_parts = [caches[main_name]] if isinstance(caches[main_name], torch.Tensor) else list(caches[main_name])
     indexer_parts = list(caches[indexer_name])
     for tensor in main_parts:

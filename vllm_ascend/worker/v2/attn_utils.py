@@ -97,12 +97,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
 from vllm_ascend.kv_offload.dsa_pd_mooncake import (
-    empty_mooncake_cpu_kv_memory,
-    get_dsa_pd_shared_host_pool,
-    initialize_dsa_pd_shared_host_pool,
-    register_dsa_pd_mooncake_cpu_kv_buffer,
-    register_dsa_pd_mooncake_offloaded_kv_tensor,
-    reset_dsa_pd_mooncake_kv_registries,
+    get_dsa_pd_mooncake_kv_registry,
     should_use_dsa_pd_mooncake_cpu_kv,
     should_use_dsa_pd_mooncake_long_context_kv,
 )
@@ -942,15 +937,6 @@ def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     return tensor[int(offset) :]
 
 
-# DSA PD Mooncake offloaded-KV allocation state (V2 function-style port of the
-# V1 runner methods). _dsa_pd_mooncake_pending_offloaded_ranges collects the
-# (ptr, numel) of every swapped-memory allocation made during
-# _allocate_kv_cache; _register_dsa_pd_mooncake_final_kv_views then binds each
-# range to the final runtime tensor views so the connector registry can serve
-# the true device-visible tensors.
-_dsa_pd_mooncake_pending_offloaded_ranges: list[tuple[int, int]] = []
-
-
 def _use_dsa_pd_mooncake_cpu_kv(vllm_config, *, is_sparse_kv_cache: bool) -> bool:
     from vllm_ascend.ascend_config import get_ascend_config
 
@@ -966,68 +952,6 @@ def _use_dsa_pd_mooncake_cpu_kv(vllm_config, *, is_sparse_kv_cache: bool) -> boo
         enable_cpu_kv_store=enable_cpu_kv_store,
         dsa_sparse_attention_mode=dsa_sparse_attention_mode,
     )
-
-
-def _allocate_dsa_pd_mooncake_kv_tensor(tensor_size: int, alignment: int) -> torch.Tensor:
-    shared_pool = get_dsa_pd_shared_host_pool()
-    if shared_pool is not None:
-        tensor = shared_pool.allocate(tensor_size, alignment)
-        # Connector registration covers backing storage, including the suffix
-        # after this aligned view. It must never register that Host padding as
-        # an HBM destination.
-        storage = tensor.untyped_storage()
-        register_dsa_pd_mooncake_cpu_kv_buffer(int(storage.data_ptr()), int(storage.nbytes()))
-        _dsa_pd_mooncake_pending_offloaded_ranges.append((int(tensor.data_ptr()), int(tensor.numel())))
-        return tensor
-    tensor = empty_mooncake_cpu_kv_memory(
-        (tensor_size + alignment,),
-        dtype=torch.int8,
-    )
-    # Registration is collected by backing storage, including alignment
-    # padding. Mark the whole Host allocation before binding its final views.
-    register_dsa_pd_mooncake_cpu_kv_buffer(int(tensor.data_ptr()), int(tensor.numel()))
-    tensor = _align_memory(tensor, alignment)[:tensor_size]
-    if tensor.data_ptr() % alignment != 0:
-        raise RuntimeError(
-            "DSA PD Mooncake offloaded KV tensor is not 2MB aligned, which is required by fixed-size NPU staging copy."
-        )
-    _dsa_pd_mooncake_pending_offloaded_ranges.append((int(tensor.data_ptr()), int(tensor.numel())))
-    return tensor
-
-
-def _register_dsa_pd_mooncake_final_kv_views(final_tensors) -> None:
-    pending_ranges = _dsa_pd_mooncake_pending_offloaded_ranges
-    if not pending_ranges:
-        return
-
-    matched_ranges: set[int] = set()
-
-    def register_tensor(tensor: torch.Tensor) -> None:
-        ptr = int(tensor.data_ptr())
-        size = int(tensor.numel() * tensor.element_size())
-        end = ptr + size
-        for range_idx, (start, length) in enumerate(pending_ranges):
-            if ptr >= start and end <= start + length:
-                if get_dsa_pd_shared_host_pool() is not None and tensor.dtype != torch.bfloat16:
-                    raise ValueError("DSA TP-shared Host KV requires BF16 main cache views")
-                register_dsa_pd_mooncake_offloaded_kv_tensor(tensor)
-                matched_ranges.add(range_idx)
-                return
-
-    def walk(value) -> None:
-        if isinstance(value, torch.Tensor):
-            register_tensor(value)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                walk(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                walk(item)
-
-    walk(final_tensors)
-
-    if len(matched_ranges) != len(pending_ranges):
-        raise RuntimeError("Failed to bind all DSA PD Mooncake offloaded KV allocations to final runtime tensor views.")
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -1636,7 +1560,7 @@ def _allocate_kv_cache(
             use_host_kv = should_use_dsa_pd_mooncake_long_context_kv(vllm_config)
             for layer_name in shared_names:
                 kv_cache_raw_tensors[layer_name] = (
-                    _allocate_dsa_pd_mooncake_kv_tensor(k_size, alignment)
+                    get_dsa_pd_mooncake_kv_registry().allocate(k_size, alignment)
                     if use_host_kv
                     else _allocate_int8_cache_tensor(k_size, alignment, device)
                 )
@@ -1682,8 +1606,8 @@ def _allocate_kv_cache(
                     is_sparse_kv_cache=True,
                 )
                 if use_dsa_pd_mooncake_cpu_kv:
-                    k_tensor = _allocate_dsa_pd_mooncake_kv_tensor(k_size, alignment)
-                    v_tensor = _allocate_dsa_pd_mooncake_kv_tensor(v_size, alignment)
+                    k_tensor = get_dsa_pd_mooncake_kv_registry().allocate(k_size, alignment)
+                    v_tensor = get_dsa_pd_mooncake_kv_registry().allocate(v_size, alignment)
                 else:
                     k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
                     v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
@@ -1703,8 +1627,8 @@ def _allocate_kv_cache(
             use_host_kv = should_use_dsa_pd_mooncake_long_context_kv(vllm_config)
             for layer_name in shared_names:
                 if use_host_kv:
-                    k_tensor = _allocate_dsa_pd_mooncake_kv_tensor(k_size, alignment)
-                    v_tensor = _allocate_dsa_pd_mooncake_kv_tensor(v_size, alignment)
+                    k_tensor = get_dsa_pd_mooncake_kv_registry().allocate(k_size, alignment)
+                    v_tensor = get_dsa_pd_mooncake_kv_registry().allocate(v_size, alignment)
                 else:
                     k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
                     v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
@@ -1745,16 +1669,8 @@ def allocate_kv_cache_main(
     from vllm_ascend.ascend_config import get_ascend_config
 
     dsa_sparse_config = getattr(get_ascend_config(), "dsa_sparse_attention_config", None)
-    if getattr(dsa_sparse_config, "mode", None) == "fused_overlap":
-        reset_dsa_pd_mooncake_kv_registries()
-    _dsa_pd_mooncake_pending_offloaded_ranges.clear()
-
-    if getattr(dsa_sparse_config, "tp_shared_host_kv", False):
-        # Raw tensor sizes include device-only groups; this conservative
-        # capacity also covers two separately aligned main components/layer.
-        capacity = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
-        capacity += len(attn_layers) * 2 * (2 * 1024 * 1024)
-        initialize_dsa_pd_shared_host_pool(vllm_config, capacity)
+    dsa_registry = get_dsa_pd_mooncake_kv_registry()
+    dsa_registry.initialize(vllm_config, kv_cache_config, dsa_sparse_config, num_layers=len(attn_layers))
 
     raw_tensors = _allocate_kv_cache(
         kv_cache_config,
@@ -1798,14 +1714,14 @@ def allocate_kv_cache_main(
     if (
         should_use_dsa_pd_mooncake_long_context_kv(vllm_config)
         and kv_caches
-        and not _dsa_pd_mooncake_pending_offloaded_ranges
+        and not dsa_registry.has_pending_allocations
     ):
         raise RuntimeError(
             "DSA Mooncake Host KV was requested, but no Host main KV was allocated. "
             "The current cache layout does not support the Host staging path."
         )
-    _register_dsa_pd_mooncake_final_kv_views(kv_caches)
-    _dsa_pd_mooncake_pending_offloaded_ranges.clear()
+    # The runner registers final Host views through the same pre-connector
+    # hook as SFA after upstream has bound every attention cache.
     return kv_caches
 
 
