@@ -419,6 +419,8 @@ class MooncakeBaseConnectorWorker:
             and not is_dsa_pd_mooncake_offloaded_kv_buffer(ptr, length)
             and (self._sfa_host_kv is None or self._sfa_host_kv.registry.get_register_location(ptr, length) != "cpu")
         ]
+        if self._sfa_host_kv is not None:
+            device_regions = list(dict.fromkeys([*device_regions, *self._sfa_host_kv.device_register_regions()]))
         if device_regions:
             global_te.register_buffer([ptr for ptr, _ in device_regions], [length for _, length in device_regions])
 

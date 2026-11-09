@@ -26,20 +26,33 @@ Do not also enable `dsa_sparse_attention_config.enable_cpu_kv_store` or
 allocation and shared views in this mode.
 
 The V2 connector publishes persistent Host main KV and HBM indexer/scale
-components. It excludes SFA device placeholders and hot-row scratch from PD
-payload. Main blocks are partitioned across decode TP ranks into one shared
-Host pool; the indexer remains device-resident and replicated as configured.
+components. SFA device placeholders are not PD payload. Main blocks are
+partitioned across decode TP ranks into one shared Host pool; the indexer
+remains device-resident and replicated as configured.
 
-The existing V2 batch READ and bounded staging pipeline land directly through
-the SFA manager's local-copy API. Receive completion includes the final staging
-drain. After all TP workers complete PD, the first real decode initializes the
-short-prompt hot row or incomplete circular tail from the local Host pool. This
-initialization occurs before eager execution or graph replay and adds no second
-cross-host read. Its time should be included when measuring readiness for the
-first decode, separately from the READ-to-Host receive time.
+The D worker also registers its existing rank-private HBM hot/tail buffers.
+For each request, V2 appends direct producer-to-HBM READs: a short prefix is
+placed densely in the reserved hot row; a long prefix's incomplete last block
+is placed at `hot_tokens + (logical_block % 2) * block_size` in the existing
+two-block circular tail. An aligned long prefix requires no tail READ. These
+HBM reads are replicated on every D TP rank, independently of shared Host block
+ownership. The valid prefix ends before the last prompt token replayed by V2.
+
+The existing V2 batch READ and bounded staging pipeline still land Host main
+KV through the SFA manager's local-copy API. Receive completion includes both
+direct HBM reads and the final Host staging drain. After all TP workers complete
+PD, the first real decode validates the reservation and prefix and does not
+repeat Host-to-hot initialization. Complete local prefix hits with no remote
+PD and prefix rollback retain the existing local recovery path.
+
+This adaptation changes only the V2 path. The existing SFA connector, transfer
+flow, allocation and attention operators are unchanged; no shared PD path is
+extracted.
 
 Request admission and stable hot-row reservations reuse the SFA slot allocator.
-Finished/cancelled requests release their reservations; a failed receive cannot
+Finished requests release their reservations. A cancelled in-flight PD retains
+its row until all D workers finish their reads, preventing late HBM writes from
+corrupting a reused row. A failed receive cannot
 publish a ready hot row. Subsequent decode uses the existing SFA metadata,
 LIM, Copy-SFA, hot-cache management and current-token Host writeback.
 
@@ -48,4 +61,4 @@ KV, supported device-resident indexer formats, and no context/pipeline parallel
 offload. It selects LIM + Copy-SFA; `use_fused_overlap=true` is rejected for this
 V2 combination. SFA offload uses native preprocessing, so performance comparisons
 with the legacy DSA Host path must account for the backend change, hot-buffer
-memory and first-decode initialization.
+memory and the direct HBM hot/tail PD reads.

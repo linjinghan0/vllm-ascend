@@ -576,6 +576,11 @@ class MooncakePullRecvingThread(threading.Thread):
     ) -> set[str]:
         """Build and execute transfer buckets for one producer engine."""
         remote_metadata = self._get_remote_metadata(remote_engine_id, remote_host, remote_port)
+        if getattr(self, "_shared_host_pool", None) is not None and hasattr(
+            self._shared_host_pool, "append_prefill_reads"
+        ):
+            if remote_metadata.pcp_size != 1 or remote_metadata.dcp_size != 1:
+                raise ValueError("Mooncake V2 SFA PD hot/tail reads require a producer without context parallelism")
         tp_rank_groups_by_pp_rank = self.remote_tp_rank_groups[remote_engine_id]
         layer_pairs_by_pp_rank = self.remote_layer_index_pairs[remote_engine_id]
         # Cache block mappings for this producer-engine batch:
@@ -620,6 +625,11 @@ class MooncakePullRecvingThread(threading.Thread):
                         remote_metadata.dcp_size,
                         pp_metadata,
                         transfer_entries_by_spec,
+                        **(
+                            {"sfa_requests": requests}
+                            if hasattr(getattr(self, "_shared_host_pool", None), "append_prefill_reads")
+                            else {}
+                        ),
                     )
                     future_to_task[future] = (
                         remote_pp_rank,
@@ -1525,6 +1535,8 @@ class MooncakePullRecvingThread(threading.Thread):
             int,
             dict[tuple[int, int], list[tuple[str, list[int], list[int]]]],
         ],
+        *,
+        sfa_requests: dict[str, ReqMeta] | None = None,
     ) -> None:
         """Calculate addresses and execute one remote PP/PCP/TP transfer bucket.
 
@@ -1559,9 +1571,30 @@ class MooncakePullRecvingThread(threading.Thread):
                 **({"transfer_targets": transfer_targets} if transfer_targets is not None else {}),
             )
 
-        if not src_list:
+        if not src_list and sfa_requests is None:
             return
         tp_metadata = remote_metadata.metadata_by_pcp_rank[remote_pcp_rank].metadata_by_tp_rank[remote_tp_rank]
+        if sfa_requests is not None:
+            host_kv = self._shared_host_pool
+            for entries_by_layer in transfer_entries_by_spec.values():
+                for (local_index, remote_index), entries in entries_by_layer.items():
+                    name = self.layer_names[local_index]
+                    if name not in host_kv.hot_caches:
+                        continue
+                    for request_id in dict.fromkeys(entry[0] for entry in entries):
+                        host_kv.append_prefill_reads(
+                            name,
+                            sfa_requests[request_id],
+                            tp_metadata.kv_caches_base_addr[remote_index],
+                            remote_metadata.block_strides[remote_index],
+                            remote_metadata.block_lens[remote_index],
+                            src_list,
+                            dst_list,
+                            length_list,
+                            transfer_targets,
+                        )
+        if not src_list:
+            return
         session_id = f"{tp_metadata.local_ip}:{tp_metadata.te_rpc_port}"
         request_ids = sorted(
             {
@@ -1782,7 +1815,14 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
         """Publish row reservations before MRV2 prepares attention metadata."""
         state = getattr(self, "_sfa_pd_state", None)
         if state is not None and getattr(self, "_sfa_metadata", None) is not metadata:
-            state.update(metadata.copy_sfa_slots, list(metadata.requests))
+            state.update(
+                metadata.copy_sfa_slots,
+                list(metadata.requests),
+                {
+                    req_id: min(req.num_computed_tokens + req.num_external_tokens, req.local_num_prompt_tokens - 1)
+                    for req_id, req in metadata.requests.items()
+                },
+            )
             self._sfa_metadata = metadata
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
@@ -1795,6 +1835,11 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             request_groups: dict[str, dict[str, ReqMeta]] = {}
             for request_id, request_metadata in metadata.requests.items():
                 requests = request_groups.setdefault(request_metadata.remote_engine_id, {})
+                if (
+                    getattr(self, "_sfa_pd_state", None) is not None
+                    and request_metadata.copy_sfa_slot != self._sfa_pd_state.bindings[request_id]
+                ):
+                    raise ValueError("Mooncake V2 SFA PD transfer differs from its reserved hot row")
                 requests[request_id] = request_metadata
 
             for remote_engine_id, requests in request_groups.items():

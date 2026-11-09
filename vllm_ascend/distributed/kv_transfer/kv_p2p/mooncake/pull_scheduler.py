@@ -535,6 +535,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._recving_thread: MooncakeSchedulerRecvingThread | None = None
 
         self._copy_sfa_slot_allocator = None
+        self._copy_sfa_deferred_releases: set[str] = set()
         sparse_cfg = getattr(self.ascend_config, "sparse_kv_offload_config", None)
         if self.kv_transfer_config.is_kv_consumer and sparse_cfg is not None and sparse_cfg.use_fused_copy_sfa:
             from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
@@ -670,6 +671,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata()
+        allocator = getattr(self, "_copy_sfa_slot_allocator", None)
 
         for (
             req_id,
@@ -683,6 +685,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                 local_num_prompt_tokens=req.num_prompt_tokens,
                 num_external_tokens=num_external_tokens,
                 kv_transfer_params=req.kv_transfer_params,
+                **({"copy_sfa_slot": allocator.get(req_id)} if allocator is not None else {}),
             )
 
         self._reqs_need_recv.clear()
@@ -701,7 +704,15 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         """Expose completed producer blocks for a remote READ transfer."""
         allocator = getattr(self, "_copy_sfa_slot_allocator", None)
         if allocator is not None:
-            allocator.release(request.request_id)
+            if request.request_id in self._reqs_recv_info:
+                # An aborted async PD may still write this rank-private row.
+                # Reuse it only after completion from every D worker.
+                deferred = getattr(self, "_copy_sfa_deferred_releases", None)
+                if deferred is None:
+                    deferred = self._copy_sfa_deferred_releases = set()
+                deferred.add(request.request_id)
+            else:
+                allocator.release(request.request_id)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector request_finished: request_status=%s, kv_transfer_params=%s",
@@ -777,6 +788,11 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         # workers. Send one scheduler-to-scheduler ACK for the request.
         for req_id in connector_output.finished_recving or ():
             remote = self._reqs_recv_info.pop(req_id, None)
+            deferred = getattr(self, "_copy_sfa_deferred_releases", ())
+            if req_id in deferred:
+                assert self._copy_sfa_slot_allocator is not None
+                self._copy_sfa_slot_allocator.release(req_id)
+                deferred.remove(req_id)
             if remote is not None:
                 if self._recving_thread is None:
                     raise RuntimeError("Producer Mooncake scheduler received a receive-completion event")

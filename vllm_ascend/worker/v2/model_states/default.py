@@ -511,9 +511,9 @@ class AscendModelState(DefaultModelState):
                 getter = getattr(get_kv_transfer_group(), "get_copy_sfa_pd_state", None)
                 pd_state = getter() if getter is not None else None
                 if pd_state is not None:
-                    # This request is scheduled only after all TP receivers have
-                    # reported Host landing complete. Initialize from that pool,
-                    # without a second network read or a background TP barrier.
+                    # Remote completion includes both Host landing and direct
+                    # HBM hot/tail reads. Only a complete local prefix hit with
+                    # no remote PD needs local row initialization here.
                     pd_restore_tails, pd_dense_fills, pd_initialized = pd_state.prepare(
                         input_batch.req_ids[: input_batch.num_reqs],
                         pool_slots.np,

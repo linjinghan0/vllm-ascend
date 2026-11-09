@@ -9,6 +9,6 @@ entries:
   - category: feature
     text: Adapted DSA Host KV offload to MooncakeConnectorV2 with ModelRunner V2, preserving bounded staging, pipeline landing, and completion ordering.
   - category: feature
-    text: Connected MooncakeConnectorV2 with ModelRunner V2 to the existing SFA Host KV manager and LIM + Copy-SFA backend, preserving pipelined PD landing and initializing request hot rows from local Host KV before first decode.
+    text: Connected MooncakeConnectorV2 with ModelRunner V2 to the existing SFA Host KV manager and LIM + Copy-SFA backend, preserving pipelined Host landing and directly priming rank-local HBM hot rows and circular tails during PD, without changing the existing SFA connector flow.
   - category: bugfix
     text: Used the native int32 byte-length ABI for SFA dense hot-row initialization while retaining int64 source and destination offsets.
