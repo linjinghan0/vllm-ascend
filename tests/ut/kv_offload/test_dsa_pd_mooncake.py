@@ -51,7 +51,7 @@ class TestDSAPDMooncakeCPUKV(TestCase):
     def test_long_context_kv_uses_dsa_additional_config(self):
         kv_transfer_config = SimpleNamespace(
             is_kv_consumer=True,
-            kv_connector="MooncakeLayerwiseConnector",
+            kv_connector="MooncakeConnectorV2",
             kv_connector_extra_config={},
         )
         vllm_config = SimpleNamespace(
@@ -75,6 +75,32 @@ class TestDSAPDMooncakeCPUKV(TestCase):
         vllm_config.additional_config["dsa_sparse_attention_config"]["mode"] = "fused_overlap"
         kv_transfer_config.is_kv_consumer = False
         self.assertFalse(should_use_dsa_pd_mooncake_long_context_kv(vllm_config))
+
+    def test_cpu_kv_rejects_layerwise_connector_before_allocation(self):
+        for connector, extra in [
+            ("MooncakeLayerwiseConnector", {}),
+            ("MultiConnector", {"connectors": [{"kv_connector": "MooncakeLayerwiseConnector"}]}),
+            ("MultiConnector", {"connectors": {"pd": {"kv_connector": "MooncakeLayerwiseConnector"}}}),
+        ]:
+            with self.subTest(connector=connector, extra=extra):
+                kv_transfer_config = SimpleNamespace(
+                    is_kv_consumer=True,
+                    kv_connector=connector,
+                    kv_connector_extra_config=extra,
+                )
+                vllm_config = SimpleNamespace(
+                    additional_config={
+                        "dsa_sparse_attention_config": {"mode": "fused_overlap", "enable_cpu_kv_store": True},
+                    },
+                    model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),
+                    kv_transfer_config=kv_transfer_config,
+                )
+                with self.assertRaisesRegex(ValueError, "does not support MooncakeLayerwiseConnector"):
+                    should_use_dsa_pd_mooncake_long_context_kv(vllm_config)
+
+                # Ordinary layerwise use must remain valid without DSA CPU offload.
+                vllm_config.additional_config["dsa_sparse_attention_config"]["enable_cpu_kv_store"] = False
+                self.assertFalse(should_use_dsa_pd_mooncake_long_context_kv(vllm_config))
 
     def test_cpu_kv_requires_decode_consumer_sparse_fused_mooncake(self):
         kv_transfer_config = SimpleNamespace(

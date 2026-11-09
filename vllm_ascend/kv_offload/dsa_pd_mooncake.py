@@ -381,7 +381,7 @@ def should_use_dsa_pd_mooncake_cpu_kv(
     if dsa_sparse_attention_mode == "baseline":
         return False
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-    return bool(
+    use_cpu_kv = bool(
         use_sparse
         and is_kv_consumer
         and enable_cpu_kv_store
@@ -389,6 +389,12 @@ def should_use_dsa_pd_mooncake_cpu_kv(
         and getattr(kv_transfer_config, "is_kv_consumer", False)
         and kv_transfer_uses_mooncake(kv_transfer_config)
     )
+    if use_cpu_kv and "MooncakeLayerwiseConnector" in _iter_connector_names(kv_transfer_config):
+        raise ValueError(
+            "DSA CPU KV offload does not support MooncakeLayerwiseConnector. "
+            "Use MooncakeConnectorV1 or MooncakeConnectorV2 for request-level transfers."
+        )
+    return use_cpu_kv
 
 
 def empty_mooncake_cpu_kv_memory(

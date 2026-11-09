@@ -96,6 +96,12 @@ For startup scripts and a proxy example, see
 
 #### DSA Host KV offload with MooncakeConnectorV2
 
+DSA CPU-offloaded KV uses request-level Mooncake transfers after Prefill finishes.
+`MooncakeLayerwiseConnector` does not support this DSA CPU-offload path and is
+rejected before offloaded KV allocation. Its ordinary layerwise transfer remains
+available without DSA CPU offload. `SfaRemoteD2HConnector` retains its separate
+layerwise Decode-offload protocol.
+
 With vLLM 0.32.0, enable ModelRunner V2 with
 `VLLM_USE_V2_MODEL_RUNNER=1` and select `MooncakeConnectorV2` on both nodes:
 
