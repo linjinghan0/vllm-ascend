@@ -146,6 +146,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
         self.reqs_in_batch: set[str] = set()
+        # Scheduler-to-worker only; never included in the cross-host handshake.
+        self.copy_sfa_slots: dict[str, int] = {}
 
     def add_new_req(
         self,

@@ -1778,6 +1778,22 @@ class SparseKVOffloadConfig:
             raise ValueError("Sparse KV offload is not supported on 950PR&950DT Products")
 
         kv_transfer_config = vllm_config.kv_transfer_config
+        if (
+            kv_transfer_config is not None
+            and getattr(kv_transfer_config, "kv_connector", None) == "MooncakeConnectorV2"
+        ):
+            import vllm.envs as vllm_envs
+
+            if not vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
+                raise ValueError("MooncakeConnectorV2 Sparse KV offload requires ModelRunner V2")
+            if self.use_fused_overlap:
+                raise ValueError("MooncakeConnectorV2 Sparse KV offload currently requires LIM + Copy-SFA")
+            dsa = (getattr(vllm_config, "additional_config", None) or {}).get("dsa_sparse_attention_config", {})
+            if dsa.get("enable_cpu_kv_store", False) or dsa.get("tp_shared_host_kv", False):
+                raise ValueError(
+                    "MooncakeConnectorV2 Sparse KV offload owns its Host KV through SparseKVOffloadManager; "
+                    "disable dsa_sparse_attention_config.enable_cpu_kv_store and tp_shared_host_kv"
+                )
         if kv_transfer_config is not None and kv_transfer_config.has_connector("PreemptOffloadConnector"):
             raise ValueError("Sparse KV offload cannot be combined with PreemptOffloadConnector")
 

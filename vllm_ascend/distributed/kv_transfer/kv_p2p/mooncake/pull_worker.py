@@ -135,6 +135,9 @@ class MooncakePullRecvingThread(threading.Thread):
             if staging_reader is not None
             else None
         )
+        self._shared_host_pool = (
+            staging_reader.get_shared_host_pool() if isinstance(staging_reader, DSAPDMooncakeStagingReader) else None
+        )
 
         self.use_mla = self.model_config.is_deepseek_mla
         hf_text_config = self.model_config.hf_text_config
@@ -1166,11 +1169,12 @@ class MooncakePullRecvingThread(threading.Thread):
         transfer_targets: list[DSAPDMooncakeTransferTarget] | None = None,
         local_target: DSAPDMooncakeTransferTarget | None = None,
         shared_block_groups: dict[tuple[int, int, bool], tuple[list[list[int]], list[list[int]]]] | None = None,
+        shared_host_pool: Any = None,
     ) -> None:
         """Append addresses, optionally reusing this request's TP ownership plan."""
         if transfer_len <= 0:
             return
-        shared_pool = get_dsa_pd_shared_host_pool()
+        shared_pool = shared_host_pool or get_dsa_pd_shared_host_pool()
         if shared_pool is not None and shared_pool.contains(local_base_addr):
             coalesce = local_block_stride == remote_block_stride == transfer_len
             key = (shared_pool.rank, shared_pool.size, coalesce)
@@ -1355,6 +1359,11 @@ class MooncakePullRecvingThread(threading.Thread):
                             length_list=length_list,
                             shared_block_groups=shared_block_groups_by_request[request_id],
                             **(
+                                {"shared_host_pool": self._shared_host_pool}
+                                if getattr(self, "_shared_host_pool", None) is not None
+                                else {}
+                            ),
+                            **(
                                 {
                                     "transfer_targets": transfer_targets,
                                     "local_target": self._transfer_targets[local_layer_index][cache_index],
@@ -1488,6 +1497,11 @@ class MooncakePullRecvingThread(threading.Thread):
                         dst_list=dst_list,
                         length_list=length_list,
                         shared_block_groups=shared_block_groups_by_request[request_id],
+                        **(
+                            {"shared_host_pool": self._shared_host_pool}
+                            if getattr(self, "_shared_host_pool", None) is not None
+                            else {}
+                        ),
                         **(
                             {
                                 "transfer_targets": transfer_targets,
@@ -1712,11 +1726,22 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
     ) -> None:
         """Register caches and start the D-side pull execution thread."""
         super().register_kv_caches(kv_caches)
+        self._sfa_pd_state = None
+        self._sfa_metadata = None
         if self.kv_transfer_config.is_kv_consumer:
             if not isinstance(self.xfer_handshake_metadata, MooncakeTransferMetadata):
                 raise RuntimeError("Mooncake KV caches were registered without transfer metadata")
             staging_reader = None
-            if any(
+            host_kv = getattr(self, "_sfa_host_kv", None)
+            if host_kv is not None:
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import (
+                    MooncakeSFAPDState,
+                    MooncakeSFAStagingReader,
+                )
+
+                staging_reader = MooncakeSFAStagingReader(self.engine, host_kv, self.xfer_handshake_metadata.block_lens)
+                self._sfa_pd_state = MooncakeSFAPDState(host_kv.main_group_id)
+            elif any(
                 is_dsa_pd_mooncake_offloaded_kv_buffer(int(cache.data_ptr()), int(cache.nbytes))
                 for cache_or_caches in kv_caches.values()
                 for cache in as_kv_cache_tensors(cache_or_caches)
@@ -1753,8 +1778,16 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             if not self._recving_thread.is_alive():
                 raise RuntimeError("Mooncake pull receiving thread failed to start")
 
+    def prepare_sparse_kv_offload(self, metadata: MooncakeConnectorMetadata) -> None:
+        """Publish row reservations before MRV2 prepares attention metadata."""
+        state = getattr(self, "_sfa_pd_state", None)
+        if state is not None and getattr(self, "_sfa_metadata", None) is not metadata:
+            state.update(metadata.copy_sfa_slots, list(metadata.requests))
+            self._sfa_metadata = metadata
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         """Start the pull operations described by scheduler metadata."""
+        self.prepare_sparse_kv_offload(metadata)
         if not metadata.requests:
             return
         if self.kv_transfer_config.is_kv_consumer:
@@ -1769,11 +1802,15 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
 
     def get_transfer_results(self) -> KVConnectorTransferResults:
         """Return completed receives, including their failure status."""
-        return (
+        results = (
             self._recving_thread.get_and_clear_finished_requests()
             if self._recving_thread is not None
             else KVConnectorTransferResults()
         )
+        state = getattr(self, "_sfa_pd_state", None)
+        if state is not None:
+            state.record_received(results.finished_recving, results.failed_recving)
+        return results
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return local block IDs whose pull operations failed."""

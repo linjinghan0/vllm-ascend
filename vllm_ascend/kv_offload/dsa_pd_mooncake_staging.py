@@ -145,6 +145,24 @@ class DSAPDMooncakeStagingMixin:
     kv_caches: dict[str, Any]
     block_len_per_addr: list[list[int]]
 
+    def _resolve_host_tensor(self, ptr: int, size: int):
+        return get_dsa_pd_mooncake_offloaded_kv_tensor(ptr, size)
+
+    def _resolve_host_bytes(self, ptr: int, size: int):
+        return get_dsa_pd_mooncake_offloaded_kv_byte_tensor(ptr, size)
+
+    def _host_register_location(self, ptr: int, size: int):
+        return get_dsa_pd_mooncake_kv_register_location(ptr, size)
+
+    def _prepare_host_targets(self, targets, ptrs, lengths):
+        return prepare_dsa_pd_mooncake_transfer_targets(targets, ptrs, lengths)
+
+    def _create_host_targets(self, layers):
+        return create_dsa_pd_mooncake_transfer_targets(layers)
+
+    def get_shared_host_pool(self):
+        return get_dsa_pd_shared_host_pool()
+
     def _init_dsa_pd_mooncake_staging(self) -> None:
         self._dsa_pd_mooncake_staging_storage: torch.Tensor | None = None
         self._dsa_pd_mooncake_staging_tensor: torch.Tensor | None = None
@@ -232,7 +250,7 @@ class DSAPDMooncakeStagingMixin:
         bank: _DSAPDMooncakeStagingBank | None = None,
     ) -> None:
         if target_bytes is None:
-            resolved = get_dsa_pd_mooncake_offloaded_kv_byte_tensor(dst, length)
+            resolved = self._resolve_host_bytes(dst, length)
             if resolved is None:
                 raise RuntimeError(f"Missing DSA PD Mooncake offloaded KV tensor for dst={dst} length={length}.")
             target_bytes, target_offset = resolved
@@ -434,7 +452,7 @@ class DSAPDMooncakeStagingMixin:
                 count = 1 if batch.has_overlapping_copies else min(len(streams), max(1, len(batch.copies)))
                 for index, stream in enumerate(streams[:count]):
                     with torch.npu.stream(stream):
-                        shared_pool = get_dsa_pd_shared_host_pool()
+                        shared_pool = self.get_shared_host_pool()
                         if shared_pool is not None:
                             shared_pool.land(batch.copies[index::count], staging, bank.inflight_owners)
                         else:
@@ -469,7 +487,7 @@ class DSAPDMooncakeStagingMixin:
         else:
             land_started = time.perf_counter()
             try:
-                shared_pool = get_dsa_pd_shared_host_pool()
+                shared_pool = self.get_shared_host_pool()
                 if shared_pool is not None:
                     shared_pool.land(batch.copies, staging, bank.inflight_owners)
                 else:
@@ -645,7 +663,7 @@ class DSAPDMooncakeStagingMixin:
             requires_staging = any(target.offloaded for target in transfer_targets)
         else:
             requires_staging = any(
-                get_dsa_pd_mooncake_offloaded_kv_tensor(local_dst, length) is not None
+                self._resolve_host_tensor(local_dst, length) is not None
                 for local_dst, length in zip(src_list, length_list)
             )
         target_kwargs = {} if transfer_targets is None else {"transfer_targets": transfer_targets}
@@ -676,7 +694,7 @@ class DSAPDMooncakeStagingMixin:
         # Validate the layout once under the staging lock, then use its targets
         # directly instead of rediscovering Host/HBM from every destination.
         resolved_targets = (
-            prepare_dsa_pd_mooncake_transfer_targets(transfer_targets, src_list, length_list)
+            self._prepare_host_targets(transfer_targets, src_list, length_list)
             if transfer_targets is not None
             else None
         )
@@ -694,10 +712,10 @@ class DSAPDMooncakeStagingMixin:
             resolved = (
                 resolved_targets[position]
                 if resolved_targets is not None
-                else get_dsa_pd_mooncake_offloaded_kv_byte_tensor(local_dst, length)
+                else self._resolve_host_bytes(local_dst, length)
             )
             if resolved is None:
-                if resolved_targets is None and get_dsa_pd_mooncake_kv_register_location(local_dst, length) == "cpu":
+                if resolved_targets is None and self._host_register_location(local_dst, length) == "cpu":
                     raise RuntimeError("Missing DSA PD Mooncake offloaded KV tensor for a Host READ destination.")
                 direct_src_list.append(local_dst)
                 direct_dst_list.append(remote_src)
@@ -879,7 +897,7 @@ class DSAPDMooncakeStagingReader(DSAPDMooncakeStagingMixin):
             if [int(tensor.data_ptr()) for tensor in tensors] != addresses:
                 raise ValueError("Mooncake local KV tensor identity differs from address metadata.")
             layers.append(tensors)
-        return create_dsa_pd_mooncake_transfer_targets(layers)
+        return self._create_host_targets(layers)
 
     def batch_transfer_sync_read(
         self,

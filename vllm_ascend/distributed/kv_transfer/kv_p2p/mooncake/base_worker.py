@@ -295,6 +295,18 @@ class MooncakeBaseConnectorWorker:
         """Register configured KV cache allocations and publish metadata."""
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
+        self._sfa_host_kv = None
+        sparse_cfg = getattr(self.ascend_config, "sparse_kv_offload_config", None)
+        if sparse_cfg is not None and sparse_cfg.enabled and self.kv_transfer_config.is_kv_consumer:
+            # MRV2 has already registered the manager before connector setup.
+            # Only persistent Host main KV and device indexer views go on wire.
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import MooncakeSFAHostKV
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                get_sparse_kv_offload_manager,
+            )
+
+            self._sfa_host_kv = MooncakeSFAHostKV(get_sparse_kv_offload_manager(), kv_caches)
+            kv_caches = self._sfa_host_kv.transfer_caches
         self.kv_caches = kv_caches
         self._build_kv_cache_spec_mappings()
         owners = (
@@ -405,6 +417,7 @@ class MooncakeBaseConnectorWorker:
             for ptr, length in zip(register_regions.ptrs, register_regions.lengths)
             if get_dsa_pd_mooncake_kv_register_location(ptr, length) != "cpu"
             and not is_dsa_pd_mooncake_offloaded_kv_buffer(ptr, length)
+            and (self._sfa_host_kv is None or self._sfa_host_kv.registry.get_register_location(ptr, length) != "cpu")
         ]
         if device_regions:
             global_te.register_buffer([ptr for ptr, _ in device_regions], [length for _, length in device_regions])

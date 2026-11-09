@@ -27,6 +27,7 @@ import torch
 import torch.distributed as dist
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dp_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheConfig
@@ -480,6 +481,9 @@ class AscendModelState(DefaultModelState):
         pool_active = getattr(self, "_offload_pool_active", None)
         request_states = getattr(self, "_offload_request_states", None)
         restore_copy_sfa_tails = False
+        pd_state = None
+        pd_initialized: set[str] = set()
+        pd_restore_tails = False
         if request_states is not None:
             assert pool_slots is not None and pool_active is not None
             offload_dummy = getattr(input_batch, "is_dummy", False)
@@ -503,11 +507,27 @@ class AscendModelState(DefaultModelState):
                 dummy=offload_dummy,
                 lim_cache_histories=histories,
             )
+            if not offload_dummy and has_kv_transfer_group():
+                getter = getattr(get_kv_transfer_group(), "get_copy_sfa_pd_state", None)
+                pd_state = getter() if getter is not None else None
+                if pd_state is not None:
+                    # This request is scheduled only after all TP receivers have
+                    # reported Host landing complete. Initialize from that pool,
+                    # without a second network read or a background TP barrier.
+                    pd_restore_tails, pd_dense_fills, pd_initialized = pd_state.prepare(
+                        input_batch.req_ids[: input_batch.num_reqs],
+                        pool_slots.np,
+                        input_batch.num_computed_tokens_np,
+                        block_size=self.vllm_config.cache_config.block_size,
+                        hot_tokens=get_ascend_config().sparse_kv_offload_config.topk_buffer_size,
+                    )
+                    restore_copy_sfa_tails |= pd_restore_tails
+                    dense_fills.update(pd_dense_fills)
             if dense_fills:
                 get_sparse_kv_offload_manager().dense_fill_copy_sfa_rows(
                     dense_fills,
                     block_size=self.vllm_config.cache_config.block_size,
-                    block_table=block_tables[0],
+                    block_table=block_tables[pd_state.main_group_id if pd_state is not None else 0],
                 )
         is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
@@ -569,8 +589,14 @@ class AscendModelState(DefaultModelState):
         self._prepare_decoder_replay(input_batch, cudagraph_mode, attn_groups, kv_cache_config)
         if restore_copy_sfa_tails:
             manager = get_sparse_kv_offload_manager()
+            restored = False
             for metadata in self.attn_metadata.values():
                 if getattr(metadata, "copy_sfa_copy_src_offsets", None) is not None:
                     manager.restore_copy_sfa_tails(metadata)
+                    restored = True
                     break
+            if pd_restore_tails and not restored:
+                raise RuntimeError("Mooncake V2 SFA first decode is missing its tail-copy metadata")
+        if pd_state is not None:
+            pd_state.commit(pd_initialized)
         return self.attn_metadata
