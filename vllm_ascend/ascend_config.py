@@ -1780,6 +1780,14 @@ class SparseKVOffloadConfig:
         kv_transfer_config = vllm_config.kv_transfer_config
         if (
             kv_transfer_config is not None
+            and getattr(kv_transfer_config, "kv_connector", None) == "MultiConnector"
+            and kv_transfer_config.has_connector("MooncakeConnectorV2")
+        ):
+            raise ValueError(
+                "MooncakeConnectorV2 Sparse KV offload currently requires a direct connector, not MultiConnector"
+            )
+        if (
+            kv_transfer_config is not None
             and getattr(kv_transfer_config, "kv_connector", None) == "MooncakeConnectorV2"
         ):
             import vllm.envs as vllm_envs
@@ -1788,6 +1796,20 @@ class SparseKVOffloadConfig:
                 raise ValueError("MooncakeConnectorV2 Sparse KV offload requires ModelRunner V2")
             if self.use_fused_overlap:
                 raise ValueError("MooncakeConnectorV2 Sparse KV offload currently requires LIM + Copy-SFA")
+            speculative = getattr(vllm_config, "speculative_config", None)
+            if speculative is not None and speculative.method == "dspark":
+                raise ValueError(
+                    "MooncakeConnectorV2 Sparse KV offload has not adapted the DSpark remote prompt protocol"
+                )
+            if (
+                kv_transfer_config.is_kv_consumer
+                and not self.keep_device_kv_cache
+                and getattr(kv_transfer_config, "kv_load_failure_policy", "fail") != "fail"
+            ):
+                raise ValueError(
+                    "MooncakeConnectorV2 Host-only Sparse KV offload requires kv_load_failure_policy='fail'; "
+                    "local prefill recomputation requires keep_device_kv_cache=True"
+                )
             dsa = (getattr(vllm_config, "additional_config", None) or {}).get("dsa_sparse_attention_config", {})
             if dsa.get("enable_cpu_kv_store", False) or dsa.get("tp_shared_host_kv", False):
                 raise ValueError(

@@ -587,16 +587,18 @@ class AscendModelState(DefaultModelState):
             ),
         )
         self._prepare_decoder_replay(input_batch, cudagraph_mode, attn_groups, kv_cache_config)
+        restored = False
         if restore_copy_sfa_tails:
             manager = get_sparse_kv_offload_manager()
-            restored = False
             for metadata in self.attn_metadata.values():
                 if getattr(metadata, "copy_sfa_copy_src_offsets", None) is not None:
                     manager.restore_copy_sfa_tails(metadata)
                     restored = True
                     break
-            if pd_restore_tails and not restored:
-                raise RuntimeError("Mooncake V2 SFA first decode is missing its tail-copy metadata")
         if pd_state is not None:
-            pd_state.commit(pd_initialized)
+            pd_state.commit(
+                pd_initialized,
+                tail_restore_required=pd_restore_tails,
+                tails_restored=restored,
+            )
         return self.attn_metadata

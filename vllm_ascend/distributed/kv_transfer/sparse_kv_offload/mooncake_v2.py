@@ -8,7 +8,7 @@ bounded landing descriptors and the PD-to-decode readiness bookkeeping.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -21,6 +21,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 from vllm_ascend.kv_offload.dsa_pd_mooncake import _DSAPDMooncakeKVRegistry
 from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
 
+if TYPE_CHECKING:
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import MooncakeConnectorMetadata
+
 _SPARSE_COPY_MAX_BYTES = (1 << 31) - 1
 
 
@@ -29,28 +32,22 @@ class MooncakeSFAHostKV:
 
     def __init__(self, manager: Any, kv_caches: dict[str, Any]) -> None:
         self.manager = manager
-        self.rank = manager.tp_rank
-        self.size = manager.tp_group.world_size
-        main_groups = {
-            group_id
-            for group_id, group in enumerate(manager.kv_cache_config.kv_cache_groups)
-            if set(group.layer_names) & set(manager.offload_layer_names)
-        }
-        if len(main_groups) != 1:
-            raise ValueError("Mooncake V2 SFA requires one main KV cache group")
-        self.main_group_id = main_groups.pop()
+        views = manager.get_copy_sfa_cache_views()
+        self.rank = views.tp_rank
+        self.size = views.tp_size
+        self.main_group_id = views.main_group_id
         # Reuse transfer identity/range validation without allocating a DSA pool
         # or publishing the SFA views into the legacy process-global registry.
         self.registry = _DSAPDMooncakeKVRegistry()
         self.transfer_caches = dict(kv_caches)
         self.hot_caches = {}
-        self.block_size = manager.kv_cache_config.kv_cache_groups[self.main_group_id].kv_cache_spec.block_size
-        self.hot_tokens = manager.topk_buffer_size
-        for name in manager.offload_layer_names:
+        self.block_size = views.block_size
+        self.hot_tokens = views.hot_tokens
+        for layer in views.layers:
+            name = layer.layer_name
             if len(kv_caches[name]) != OFFLOAD_KV_CACHE_TUPLE_LEN:
                 raise ValueError(f"Mooncake V2 SFA layer {name!r} must expose the SFA six-component cache")
-            layer_id = manager._get_offload_layer_id(name)
-            pair = (manager.k_caches_cpu[layer_id], manager.v_caches_cpu[layer_id])
+            pair = layer.host_kv
             for tensor in pair:
                 if tensor.device.type != "cpu" or tensor.dtype != torch.bfloat16 or not tensor.is_contiguous():
                     raise ValueError("Mooncake V2 SFA Host KV must be contiguous BF16 CPU views")
@@ -60,7 +57,7 @@ class MooncakeSFAHostKV:
             # Keep main-component wire identity unchanged; hot/tail READs use
             # separate rank-private destinations, not extra wire components.
             self.transfer_caches[name] = pair
-            hot_pair = (manager.topk_buffers_k[layer_id], manager.topk_buffers_v[layer_id])
+            hot_pair = layer.hot_kv
             for host, hot in zip(pair, hot_pair):
                 if hot.dtype != host.dtype or not hot.is_contiguous() or hot.ndim != 4:
                     raise ValueError("Mooncake V2 SFA hot KV must be contiguous BF16 row buffers")
@@ -204,6 +201,30 @@ class MooncakeSFAPDState:
         self.remote: set[str] = set()
         self.remote_prefixes: dict[str, int] = {}
         self.remote_prefill_tokens: dict[str, int] = {}
+        self._metadata: MooncakeConnectorMetadata | None = None
+
+    def bind_metadata(self, metadata: MooncakeConnectorMetadata) -> None:
+        """Publish transport facts before MRV2 builds existing SFA metadata.
+
+        The early runner hook and ordered load hook see the same object. Only
+        its first bind may create pending initialization; repeated binds must
+        not reinitialize a row whose first decode has already committed.
+        """
+        if self._metadata is metadata:
+            return
+        self.update(
+            metadata.copy_sfa_slots,
+            list(metadata.requests),
+            {
+                req_id: min(req.num_computed_tokens + req.num_external_tokens, req.local_num_prompt_tokens - 1)
+                for req_id, req in metadata.requests.items()
+            },
+            {
+                req_id: min(req.num_computed_tokens + req.num_external_tokens, req.remote_num_prompt_tokens)
+                for req_id, req in metadata.requests.items()
+            },
+        )
+        self._metadata = metadata
 
     def update(
         self,
@@ -281,7 +302,18 @@ class MooncakeSFAPDState:
             initialized.add(req_id)
         return restore_tails, dense_fills, initialized
 
-    def commit(self, initialized: set[str]) -> None:
+    def commit(
+        self,
+        initialized: set[str],
+        *,
+        tail_restore_required: bool = False,
+        tails_restored: bool = False,
+    ) -> None:
+        """Retire one-time PD state only after the existing copy APIs succeed."""
+        if tail_restore_required and not tails_restored:
+            raise RuntimeError("Mooncake V2 SFA first decode is missing its tail-copy metadata")
+        if not initialized <= self.pending & self.received:
+            raise RuntimeError("Mooncake V2 SFA cannot commit initialization before successful receive")
         self.pending.difference_update(initialized)
         self.received.difference_update(initialized)
         self.remote.difference_update(initialized)

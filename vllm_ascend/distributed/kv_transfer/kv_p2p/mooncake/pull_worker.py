@@ -1760,7 +1760,6 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
         """Register caches and start the D-side pull execution thread."""
         super().register_kv_caches(kv_caches)
         self._sfa_pd_state = None
-        self._sfa_metadata = None
         if self.kv_transfer_config.is_kv_consumer:
             if not isinstance(self.xfer_handshake_metadata, MooncakeTransferMetadata):
                 raise RuntimeError("Mooncake KV caches were registered without transfer metadata")
@@ -1814,20 +1813,8 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
     def prepare_sparse_kv_offload(self, metadata: MooncakeConnectorMetadata) -> None:
         """Publish row reservations before MRV2 prepares attention metadata."""
         state = getattr(self, "_sfa_pd_state", None)
-        if state is not None and getattr(self, "_sfa_metadata", None) is not metadata:
-            state.update(
-                metadata.copy_sfa_slots,
-                list(metadata.requests),
-                {
-                    req_id: min(req.num_computed_tokens + req.num_external_tokens, req.local_num_prompt_tokens - 1)
-                    for req_id, req in metadata.requests.items()
-                },
-                {
-                    req_id: min(req.num_computed_tokens + req.num_external_tokens, req.remote_num_prompt_tokens)
-                    for req_id, req in metadata.requests.items()
-                },
-            )
-            self._sfa_metadata = metadata
+        if state is not None:
+            state.bind_metadata(metadata)
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         """Start the pull operations described by scheduler metadata."""

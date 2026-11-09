@@ -54,3 +54,39 @@ def test_rejects_model_runner_v1(monkeypatch):
 def test_rejects_unadapted_overlap_backend():
     with pytest.raises(ValueError, match="LIM \\+ Copy-SFA"):
         SparseKVOffloadConfig.from_additional_config(config(), {"enabled": True, "use_fused_overlap": True})
+
+
+def test_rejects_dspark_before_uninitialized_remote_prompt_can_be_used():
+    cfg = config()
+    cfg.speculative_config = SimpleNamespace(method="dspark", num_speculative_tokens=1)
+    with pytest.raises(ValueError, match="DSpark remote prompt protocol"):
+        SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True})
+
+
+def test_rejects_multiconnector_without_sparse_handoff_forwarding():
+    cfg = config()
+    cfg.kv_transfer_config.kv_connector = "MultiConnector"
+    cfg.kv_transfer_config.has_connector = lambda name: name == "MooncakeConnectorV2"
+    with pytest.raises(ValueError, match="direct connector"):
+        SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True})
+
+
+def test_host_only_does_not_advertise_local_prefill_recomputation():
+    cfg = config()
+    cfg.kv_transfer_config.kv_load_failure_policy = "recompute"
+    with pytest.raises(ValueError, match="kv_load_failure_policy='fail'"):
+        SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True})
+    # Colocate debug retains device main KV and can still recompute locally.
+    resolved = SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True, "keep_device_kv_cache": True})
+    assert resolved.keep_device_kv_cache
+
+
+@pytest.mark.parametrize("connector", ["SfaRemoteD2HConnector", "MultiConnector"])
+def test_existing_sfa_configuration_is_unchanged(connector):
+    cfg = config()
+    cfg.kv_transfer_config.kv_connector = connector
+    cfg.kv_transfer_config.kv_load_failure_policy = "recompute"
+    cfg.speculative_config = SimpleNamespace(method="dspark", num_speculative_tokens=1)
+    cfg.use_v2_model_runner = True
+    resolved = SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True})
+    assert resolved.enabled

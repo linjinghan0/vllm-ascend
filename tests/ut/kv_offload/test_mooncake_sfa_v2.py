@@ -3,6 +3,7 @@
 
 import ctypes
 from contextlib import nullcontext
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -83,7 +84,9 @@ def make_manager(*, rank=0, size=2, blocks=4, k_dim=4):
         kv_cache_config=kv_config,
         _get_offload_layer_id=lambda name: 0,
         copy_sfa_kv=MagicMock(),
+        use_fused_copy_sfa=True,
     )
+    manager.get_copy_sfa_cache_views = lambda: manager_module.SparseKVOffloadManager.get_copy_sfa_cache_views(manager)
     return manager, caches
 
 
@@ -111,6 +114,46 @@ def test_projection_uses_manager_views_excludes_scratch_and_keeps_legacy_pool_em
     assert len(caches[MAIN]) == 6
     assert legacy_registry.get_dsa_pd_shared_host_pool() is None
     assert not legacy_registry.get_dsa_pd_mooncake_kv_registry()._offloaded_tensors
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_public_cache_views_borrow_exact_registered_storage_without_allocating(monkeypatch, rank):
+    manager, caches = make_manager(rank=rank)
+    if rank:
+        caches[MAIN] = (*caches[MAIN][:2], torch.empty(0), torch.empty(0), *caches[MAIN][4:])
+    monkeypatch.setattr(torch, "empty", MagicMock(side_effect=AssertionError("unexpected allocation")))
+    views = manager.get_copy_sfa_cache_views()
+    assert (views.main_group_id, views.block_size, views.hot_tokens, views.tp_rank, views.tp_size) == (
+        1,
+        128,
+        2048,
+        rank,
+        2,
+    )
+    layer = views.layers[0]
+    assert layer.layer_name == MAIN
+    assert layer.host_kv[0] is manager.k_caches_cpu[0]
+    assert layer.host_kv[1] is manager.v_caches_cpu[0]
+    assert layer.hot_kv[0] is manager.topk_buffers_k[0]
+    assert layer.hot_kv[1] is manager.topk_buffers_v[0]
+    with pytest.raises(FrozenInstanceError):
+        views.main_group_id = 0
+    # The adapter consumes only the exported layout, not manager internals.
+    public_manager = SimpleNamespace(get_copy_sfa_cache_views=lambda: views, copy_sfa_kv=manager.copy_sfa_kv)
+    host = MooncakeSFAHostKV(public_manager, caches)
+    assert host.transfer_caches[MAIN][0] is layer.host_kv[0]
+    assert host.hot_caches[MAIN][0] is layer.hot_kv[0]
+
+
+def test_cache_view_export_rejects_unregistered_or_ambiguous_main_groups():
+    manager = manager_module.SparseKVOffloadManager.__new__(manager_module.SparseKVOffloadManager)
+    manager.use_fused_copy_sfa = True
+    with pytest.raises(RuntimeError, match="registered Host and hot KV"):
+        manager.get_copy_sfa_cache_views()
+    fixture, _ = make_manager()
+    fixture.kv_cache_config.kv_cache_groups.append(fixture.kv_cache_config.kv_cache_groups[1])
+    with pytest.raises(ValueError, match="one main KV cache group"):
+        fixture.get_copy_sfa_cache_views()
 
 
 def test_v2_registration_publishes_only_persistent_components(monkeypatch):
@@ -577,3 +620,29 @@ def test_worker_keeps_producer_extent_separate_from_continuation_input():
     worker.prepare_sparse_kv_offload(meta)
     assert worker._sfa_pd_state.remote_prefill_tokens == {"r": 2176}
     assert worker._sfa_pd_state.remote_prefixes == {"r": 2176}
+
+
+def test_handoff_commit_retains_pending_on_missing_tail_and_rejects_failed_receive():
+    state = MooncakeSFAPDState(1)
+    meta = MooncakeConnectorMetadata()
+    meta.copy_sfa_slots = {"r": 0}
+    meta.requests["r"] = SimpleNamespace(
+        num_computed_tokens=0, num_external_tokens=2176, local_num_prompt_tokens=2176, remote_num_prompt_tokens=2176
+    )
+    state.bind_metadata(meta)
+    state.record_received({"r"}, set())
+    restore, _, initialized = state.prepare(["r"], [0], [2175], block_size=128, hot_tokens=2048)
+    with pytest.raises(RuntimeError, match="missing its tail-copy metadata"):
+        state.commit(initialized, tail_restore_required=restore)
+    assert state.pending == state.received == {"r"}
+    state.record_received({"r"}, {"r"})
+    with pytest.raises(RuntimeError, match="before successful receive"):
+        state.commit(initialized, tail_restore_required=restore, tails_restored=True)
+    assert state.pending == {"r"} and not state.received
+    # Cancellation removes the binding; late completion cannot initialize its replacement.
+    replacement = MooncakeConnectorMetadata()
+    replacement.copy_sfa_slots = {"next": 0}
+    state.bind_metadata(replacement)
+    state.record_received({"r"}, set())
+    assert state.pending == state.received == {"next"}
+    assert not state.remote_prefixes and not state.remote_prefill_tokens

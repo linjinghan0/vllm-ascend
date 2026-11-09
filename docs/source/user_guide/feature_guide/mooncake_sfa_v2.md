@@ -30,6 +30,14 @@ components. SFA device placeholders are not PD payload. Main blocks are
 partitioned across decode TP ranks into one shared Host pool; the indexer
 remains device-resident and replicated as configured.
 
+After manager cache registration, `get_copy_sfa_cache_views()` exports immutable
+layout metadata referencing the same Host and hot/tail tensors, including the
+restored Host aliases on non-owner TP ranks. The adapter obtains this snapshot
+once during connector registration. This interface allocates no KV storage,
+performs no device copy or synchronization, and leaves the existing PD addresses,
+transfer ranges, partitioning and staging execution unchanged. The manager owns
+the borrowed tensors for the worker lifetime; callers must not resize them.
+
 The D worker also registers its existing rank-private HBM hot/tail buffers.
 For each request, V2 appends direct producer-to-HBM READs: a short prefix is
 placed densely in the reserved hot row; a long prefix's incomplete last block
@@ -53,6 +61,13 @@ manager tail-copy API before eager execution or graph replay. Other remote
 receives do not repeat Host-to-hot initialization. Complete local prefix hits
 with no remote PD and prefix rollback retain the existing local recovery path.
 
+The adapter binds transport metadata before attention preparation and ignores
+the ordered load hook's repeated bind of that same metadata object. Successful
+initialization retires its one-time PD state only after required copies and tail
+metadata checks succeed. Failed receives cannot commit initialization. Existing
+SFA request-state tracking continues to own decode prefix history and LIM reset;
+the connector owns transport completion, ACK and in-flight cancellation.
+
 This adaptation changes only the V2 path. The existing SFA connector, transfer
 flow, allocation and attention operators are unchanged; no shared PD path is
 extracted.
@@ -70,3 +85,12 @@ offload. It selects LIM + Copy-SFA; `use_fused_overlap=true` is rejected for thi
 V2 combination. SFA offload uses native preprocessing, so performance comparisons
 with the legacy DSA Host path must account for the backend change, hot-buffer
 memory and the direct HBM hot/tail PD reads.
+
+Configure this combination directly as `MooncakeConnectorV2`. Wrapping it in
+`MultiConnector` is rejected until sparse slot and first-decode hooks are
+forwarded. DSpark's remote prompt/draft-KV protocol is also rejected for this
+combination. A Host-only decode node requires `kv_load_failure_policy="fail"`
+(the default), because it has no device main KV for local prefill recomputation.
+The `keep_device_kv_cache=true` colocate debugging mode retains its local
+recomputation option. These checks do not change the existing SFA connector's
+configuration or flow.

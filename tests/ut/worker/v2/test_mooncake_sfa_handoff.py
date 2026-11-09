@@ -64,11 +64,16 @@ def test_first_real_decode_primes_correct_group_before_graph_or_eager_forward(mo
     monkeypatch.setattr(default, "get_ascend_config", lambda: SimpleNamespace(sparse_kv_offload_config=sparse))
     monkeypatch.setattr(default, "get_sparse_kv_offload_manager", lambda: manager)
     builds = []
+    missing_tail_metadata = False
 
     def build(**kwargs):
         builds.append(kwargs)
         needs_tail = kwargs["copy_sfa_restore_tails"]
-        return {"main": SimpleNamespace(copy_sfa_copy_src_offsets=object() if needs_tail else None)}
+        return {
+            "main": SimpleNamespace(
+                copy_sfa_copy_src_offsets=object() if needs_tail and not missing_tail_metadata else None
+            )
+        }
 
     monkeypatch.setattr(default, "build_attn_metadata", build)
     tables = (torch.tensor([[1, 2]]), torch.tensor([[7, 8]]))
@@ -84,6 +89,12 @@ def test_first_real_decode_primes_correct_group_before_graph_or_eager_forward(mo
         assert pd.pending == pd.received == {"r"}
         operation.reset_mock()
         operation.side_effect = None
+    if needs_tail and not local_hit:
+        missing_tail_metadata = True
+        with pytest.raises(RuntimeError, match="missing its tail-copy metadata"):
+            state.prepare_attn(batch, mode, tables, torch.empty(0), [], None)
+        assert pd.pending == pd.received == {"r"}
+        missing_tail_metadata = False
     state.prepare_attn(batch, mode, tables, torch.empty(0), [], None)
     assert not pd.pending
     assert state._offload_pool_slots.np[0] == 2
