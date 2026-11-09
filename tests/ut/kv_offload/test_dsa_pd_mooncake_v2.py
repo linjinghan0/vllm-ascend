@@ -60,6 +60,21 @@ class TestV2MooncakeAllocatorRouting(TestCase):
             [(int(k_tensor.data_ptr()), 48), (int(v_tensor.data_ptr()), 32)],
         )
 
+    def test_shared_allocation_marks_backing_padding_as_host(self):
+        backing = torch.empty(8192, dtype=torch.int8)
+        view = attn_utils._align_memory(backing, 4096)[:48]
+        pool = SimpleNamespace(allocate=lambda size, alignment: view)
+        with patch.object(attn_utils, "get_dsa_pd_shared_host_pool", return_value=pool):
+            allocated = attn_utils._allocate_dsa_pd_mooncake_kv_tensor(48, 4096)
+        self.assertIs(allocated, view)
+        self.assertEqual(
+            dsa_pd_mooncake.get_dsa_pd_mooncake_kv_register_location(backing.data_ptr(), backing.nbytes), "cpu"
+        )
+        tail_size = backing.data_ptr() + backing.nbytes - view.data_ptr()
+        self.assertGreater(tail_size, view.nbytes)
+        self.assertEqual(dsa_pd_mooncake.get_dsa_pd_mooncake_kv_register_location(view.data_ptr(), tail_size), "cpu")
+        self.assertEqual(attn_utils._dsa_pd_mooncake_pending_offloaded_ranges, [(view.data_ptr(), 48)])
+
     def test_final_views_bind_and_clear_pending(self):
         vllm_config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto"))
         kv_config = SimpleNamespace(kv_cache_groups=[])

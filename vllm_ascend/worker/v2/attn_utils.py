@@ -98,6 +98,8 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.kv_offload.dsa_pd_mooncake import (
     empty_mooncake_cpu_kv_memory,
+    get_dsa_pd_shared_host_pool,
+    initialize_dsa_pd_shared_host_pool,
     register_dsa_pd_mooncake_cpu_kv_buffer,
     register_dsa_pd_mooncake_offloaded_kv_tensor,
     reset_dsa_pd_mooncake_kv_registries,
@@ -967,6 +969,16 @@ def _use_dsa_pd_mooncake_cpu_kv(vllm_config, *, is_sparse_kv_cache: bool) -> boo
 
 
 def _allocate_dsa_pd_mooncake_kv_tensor(tensor_size: int, alignment: int) -> torch.Tensor:
+    shared_pool = get_dsa_pd_shared_host_pool()
+    if shared_pool is not None:
+        tensor = shared_pool.allocate(tensor_size, alignment)
+        # Connector registration covers backing storage, including the suffix
+        # after this aligned view. It must never register that Host padding as
+        # an HBM destination.
+        storage = tensor.untyped_storage()
+        register_dsa_pd_mooncake_cpu_kv_buffer(int(storage.data_ptr()), int(storage.nbytes()))
+        _dsa_pd_mooncake_pending_offloaded_ranges.append((int(tensor.data_ptr()), int(tensor.numel())))
+        return tensor
     tensor = empty_mooncake_cpu_kv_memory(
         (tensor_size + alignment,),
         dtype=torch.int8,
@@ -996,6 +1008,8 @@ def _register_dsa_pd_mooncake_final_kv_views(final_tensors) -> None:
         end = ptr + size
         for range_idx, (start, length) in enumerate(pending_ranges):
             if ptr >= start and end <= start + length:
+                if get_dsa_pd_shared_host_pool() is not None and tensor.dtype != torch.bfloat16:
+                    raise ValueError("DSA TP-shared Host KV requires BF16 main cache views")
                 register_dsa_pd_mooncake_offloaded_kv_tensor(tensor)
                 matched_ranges.add(range_idx)
                 return
@@ -1734,6 +1748,13 @@ def allocate_kv_cache_main(
     if getattr(dsa_sparse_config, "mode", None) == "fused_overlap":
         reset_dsa_pd_mooncake_kv_registries()
     _dsa_pd_mooncake_pending_offloaded_ranges.clear()
+
+    if getattr(dsa_sparse_config, "tp_shared_host_kv", False):
+        # Raw tensor sizes include device-only groups; this conservative
+        # capacity also covers two separately aligned main components/layer.
+        capacity = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+        capacity += len(attn_layers) * 2 * (2 * 1024 * 1024)
+        initialize_dsa_pd_shared_host_pool(vllm_config, capacity)
 
     raw_tensors = _allocate_kv_cache(
         kv_cache_config,

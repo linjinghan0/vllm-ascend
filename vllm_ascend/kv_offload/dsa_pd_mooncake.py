@@ -54,6 +54,9 @@ class _DSAPDMooncakeKVRegistry:
         self._cpu_buffer_index: _DSAPDMooncakeRangeIndex | None = None
         self._offloaded_tensor_index: _DSAPDMooncakeRangeIndex | None = None
         self._generation = 0
+        # One cache allocation per worker process. Retain shared backing for
+        # its full lifetime, including borrowed NPU views and connector copies.
+        self.shared_host_pool = None
 
     def register_cpu_buffer(self, ptr: int, size: int) -> None:
         if ptr <= 0 or size <= 0:
@@ -402,3 +405,17 @@ def empty_mooncake_cpu_kv_memory(
     if empty_with_swapped_memory is None:
         raise RuntimeError("DSA PD Mooncake offloaded KV requires torch_npu.empty_with_swapped_memory.")
     return empty_with_swapped_memory(shape, dtype=dtype, device="npu")
+
+
+def get_dsa_pd_shared_host_pool():
+    return _DSA_PD_MOONCAKE_KV_REGISTRY.shared_host_pool
+
+
+def initialize_dsa_pd_shared_host_pool(vllm_config: Any, capacity_bytes: int) -> None:
+    from vllm_ascend.kv_offload.dsa_pd_shared_host import DSAPDSharedHostPool
+
+    if _DSA_PD_MOONCAKE_KV_REGISTRY.shared_host_pool is not None:
+        raise RuntimeError("DSA shared Host backing cannot be reinitialized in a live worker")
+    config = _get_dsa_sparse_attention_config(vllm_config)
+    port = int(_config_get(config, "shared_host_store_port", 8650))
+    _DSA_PD_MOONCAKE_KV_REGISTRY.shared_host_pool = DSAPDSharedHostPool(vllm_config, capacity_bytes, port)

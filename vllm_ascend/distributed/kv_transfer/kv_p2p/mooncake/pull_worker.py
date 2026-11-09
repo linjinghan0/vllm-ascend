@@ -50,9 +50,11 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
 )
 from vllm_ascend.kv_offload.dsa_pd_mooncake import (
     DSAPDMooncakeTransferTarget,
+    get_dsa_pd_shared_host_pool,
     is_dsa_pd_mooncake_offloaded_kv_buffer,
 )
 from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
+from vllm_ascend.kv_offload.dsa_pd_shared_host import partition_shared_block_groups
 
 _BULK_TRANSFER_ADDRESS_GROUPS = 32
 
@@ -1167,6 +1169,13 @@ class MooncakePullRecvingThread(threading.Thread):
         """Append addresses from block groups prepared for one request."""
         if transfer_len <= 0:
             return
+        shared_pool = get_dsa_pd_shared_host_pool()
+        if shared_pool is not None and shared_pool.contains(local_base_addr):
+            local_block_groups, remote_block_groups = partition_shared_block_groups(
+                local_block_groups, remote_block_groups, shared_pool.rank, shared_pool.size
+            )
+            if not local_block_groups:
+                return
         group_count = len(local_block_groups)
         if group_count == 1 and len(remote_block_groups) == 1:
             local_block_group, remote_block_group = local_block_groups[0], remote_block_groups[0]

@@ -1674,6 +1674,29 @@ class DSASparseAttentionConfig:
             raise ValueError(f"dsa_sparse_attention_config.mode must be one of {list(self._valid_modes)}")
 
         self.enable_cpu_kv_store = bool(dsa_sparse_attention_config.get("enable_cpu_kv_store", False))
+        self.tp_shared_host_kv = validate_additional_config_bool(
+            dsa_sparse_attention_config.get("tp_shared_host_kv", False),
+            "dsa_sparse_attention_config.tp_shared_host_kv",
+        )
+        self.shared_host_store_port = dsa_sparse_attention_config.get("shared_host_store_port", 8650)
+        if (
+            isinstance(self.shared_host_store_port, bool)
+            or not isinstance(self.shared_host_store_port, int)
+            or not 1 <= self.shared_host_store_port <= 65535
+        ):
+            raise ValueError("dsa_sparse_attention_config.shared_host_store_port must be in [1, 65535]")
+        if self.tp_shared_host_kv and (self.mode != "fused_overlap" or not self.enable_cpu_kv_store):
+            raise ValueError("tp_shared_host_kv requires DSA CPU KV store in fused_overlap mode")
+        if self.tp_shared_host_kv and vllm_config is not None:
+            import vllm.envs as vllm_envs
+
+            if not vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
+                raise ValueError("tp_shared_host_kv currently requires ModelRunner V2")
+            if vllm_config.kv_transfer_config is None or (
+                vllm_config.kv_transfer_config.kv_connector != "MooncakeConnectorV2"
+                or not vllm_config.kv_transfer_config.is_kv_consumer
+            ):
+                raise ValueError("tp_shared_host_kv requires the MooncakeConnectorV2 consumer")
         default_selection_topk_block_size = 1 if self.mode == "fused_overlap" else 64
         self.selection_topk_block_size = int(
             dsa_sparse_attention_config.get("selection_topk_block_size", default_selection_topk_block_size)

@@ -56,6 +56,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     OFFLOAD_KV_CACHE_TUPLE_LEN,
     OFFLOAD_V_CACHE_NPU_INDEX,
 )
+from vllm_ascend.kv_offload.dsa_pd_mooncake import get_dsa_pd_shared_host_pool
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
@@ -1858,6 +1859,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping_sfa = self._get_sfa_kv_slot_mapping(attn_metadata)
+        shared_pool = get_dsa_pd_shared_host_pool()
+        if shared_pool is not None and not shared_pool.contains(kv_cache[0].data_ptr()):
+            shared_pool = None
+        if shared_pool is not None:
+            slot_mapping_sfa = shared_pool.write_slots(slot_mapping_sfa)
         indexer_attn_metadata = self._get_indexer_attn_metadata()
 
         # Inputs and outputs may be padded for CUDA graphs
@@ -1950,7 +1956,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 cos,
                 sin,
                 kv_cache,
-                parallel_context.kv_slot_mapping,
+                (
+                    shared_pool.write_slots(parallel_context.kv_slot_mapping)
+                    if shared_pool is not None
+                    else parallel_context.kv_slot_mapping
+                ),
                 attn_metadata,
             )
             k_pe, k_nope = kv_outputs[:2]
@@ -1972,9 +1982,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 k_nope,
                 knope_scale,
                 kv_cache,
-                self._get_sfa_kv_slot_mapping(attn_metadata),
+                slot_mapping_sfa,
                 attn_metadata,
             )
+
+        if shared_pool is not None:
+            shared_pool.fence_writes()
 
         # A sharded-decode PCP rank can own no request but must still write
         # and gather KV with the other ranks.

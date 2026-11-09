@@ -202,6 +202,51 @@ host writes, multi-chunk transfers, short/long Copy-SFA requests, and read or
 local-copy failure handling. CPU descriptor tests do not establish hardware
 or model correctness.
 
+### Experimental TP-shared Host KV for DSA
+
+The eager Model Runner V2 `MooncakeConnectorV2` consumer can opt into one
+TP-shared main Host KV allocation instead of a separate full copy per rank:
+
+```json
+{
+  "dsa_sparse_attention_config": {
+    "mode": "fused_overlap",
+    "enable_cpu_kv_store": true,
+    "tp_shared_host_kv": true,
+    "shared_host_store_port": 8650
+  }
+}
+```
+
+`tp_shared_host_kv` defaults to `false`. The shared-store port is an integer
+in `[1, 65535]` and defaults to `8650`. Enable this setting only on D. The first
+implementation requires eager execution, one host for the entire TP group,
+and `DP=PP=PCP=DCP=1`; unsupported parallel configurations fail during startup.
+It also requires the installed TorchNPU borrowed-storage constructor and
+`memfabric_hybrid.offload` shared allocation/copy APIs. Initial validation
+targets the BF16 split main-KV layout; quantized main-KV layouts require
+separate validation.
+
+TP0 owns the shared CPU allocation. Other TP ranks retain non-owning NPU views
+of the imported global virtual addresses. Main Host blocks are received by one
+rank according to their physical destination block ID, while indexer/HBM
+destinations retain their rank-local transfer plans. Staging-to-Host landing
+uses the shared-memory copy API, with descriptors protected by the existing
+bank events. A successful receive still requires the final landing drain.
+
+During decode, TP0 writes newly computed main KV. Other ranks keep their
+query and indexer computation but mask main-KV write slots. A device TP
+collective after each layer's main-cache write orders visibility before any
+rank reads the shared cache. This synchronization is part of the measured
+decode cost. Selection/indexer state and other device caches stay rank-local;
+the setting retains the existing DSA attention implementation.
+
+The worker's KV registry owns the pool and borrowed views for the worker's
+lifetime. Reinitializing shared backing in a live worker is rejected. Memory
+validation must read shared Host data through its CPU owner; a non-root
+imported GVA is not an ordinary CPU mapping and must not be dereferenced with
+a CPU tensor or raw ACL Host copy.
+
 ### 3. Interface Design
 
 Taking MooncakeConnector as an example, the system is organized into three primary classes:

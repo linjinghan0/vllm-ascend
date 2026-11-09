@@ -21,6 +21,7 @@ from vllm_ascend.kv_offload.dsa_pd_mooncake import (
     get_dsa_pd_mooncake_kv_register_location,
     get_dsa_pd_mooncake_offloaded_kv_byte_tensor,
     get_dsa_pd_mooncake_offloaded_kv_tensor,
+    get_dsa_pd_shared_host_pool,
     prepare_dsa_pd_mooncake_transfer_targets,
 )
 
@@ -433,16 +434,20 @@ class DSAPDMooncakeStagingMixin:
                 count = 1 if batch.has_overlapping_copies else min(len(streams), max(1, len(batch.copies)))
                 for index, stream in enumerate(streams[:count]):
                     with torch.npu.stream(stream):
-                        for copy in batch.copies[index::count]:
-                            self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
-                                copy.destination,
-                                copy.length,
-                                copy.staging_offset,
-                                staging=staging,
-                                target_bytes=copy.target_bytes,
-                                target_offset=copy.target_offset,
-                                bank=bank,
-                            )
+                        shared_pool = get_dsa_pd_shared_host_pool()
+                        if shared_pool is not None:
+                            shared_pool.land(batch.copies[index::count], staging, bank.inflight_owners)
+                        else:
+                            for copy in batch.copies[index::count]:
+                                self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
+                                    copy.destination,
+                                    copy.length,
+                                    copy.staging_offset,
+                                    staging=staging,
+                                    target_bytes=copy.target_bytes,
+                                    target_offset=copy.target_offset,
+                                    bank=bank,
+                                )
                         if index:
                             bank.copy_events[index - 1].record(stream)
                 # Join auxiliary streams without blocking this Host worker.
@@ -464,18 +469,23 @@ class DSAPDMooncakeStagingMixin:
         else:
             land_started = time.perf_counter()
             try:
-                for copy in batch.copies:
-                    self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
-                        copy.destination,
-                        copy.length,
-                        copy.staging_offset,
-                        staging=staging,
-                        target_bytes=copy.target_bytes,
-                        target_offset=copy.target_offset,
-                        bank=bank,
-                    )
+                shared_pool = get_dsa_pd_shared_host_pool()
+                if shared_pool is not None:
+                    shared_pool.land(batch.copies, staging, bank.inflight_owners)
+                else:
+                    for copy in batch.copies:
+                        self._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
+                            copy.destination,
+                            copy.length,
+                            copy.staging_offset,
+                            staging=staging,
+                            target_bytes=copy.target_bytes,
+                            target_offset=copy.target_offset,
+                            bank=bank,
+                        )
             finally:
                 torch.npu.synchronize()
+                bank.inflight_owners.clear()
             land_exposed_secs += time.perf_counter() - land_started
         return _DSAPDMooncakeBankBatchResult(ret, read_secs, read_settle_secs, land_exposed_secs)
 

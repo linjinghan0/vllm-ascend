@@ -1,5 +1,11 @@
 pr: 19212
 entries:
+  - category: config
+    text: >-
+      Added opt-in TP-shared main Host KV for the eager Model Runner V2
+      MooncakeConnectorV2 DSA consumer through tp_shared_host_kv. One Host
+      allocation is shared across a single-host TP group, with disjoint block
+      receives and ordered single-owner decode writes; the default stays off.
   - category: performance
     text: >-
       Reduced construction overhead for immutable DSA Mooncake staging copy and
