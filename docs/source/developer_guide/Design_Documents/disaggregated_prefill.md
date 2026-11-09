@@ -228,9 +228,12 @@ targets the BF16 split main-KV layout; quantized main-KV layouts require
 separate validation.
 
 TP0 owns the shared CPU allocation. Other TP ranks retain non-owning NPU views
-of the imported global virtual addresses. Main Host blocks are received by one
-rank according to their physical destination block ID, while indexer/HBM
-destinations retain their rank-local transfer plans. Staging-to-Host landing
+of the imported global virtual addresses. Main Host blocks are sorted by physical
+destination block ID, keeping each source/destination pair intact, then divided
+into balanced consecutive ranges across the actual TP group. Each destination
+has one receiving rank. Adjacent blocks merge only when source and destination
+byte ranges are both contiguous; strided or partial-block copies retain separate
+descriptors. Indexer/HBM destinations retain their rank-local transfer plans. Staging-to-Host landing
 uses the shared-memory copy API, with descriptors protected by the existing
 bank events. A successful receive still requires the final landing drain.
 

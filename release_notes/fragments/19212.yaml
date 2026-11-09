@@ -55,3 +55,8 @@ entries:
       Removed VLLM_ASCEND_DSA_PD_MOONCAKE_BANK_WORKERS and ignored its old values,
       so the default pipelined setup now uses four workers instead of the caller
       thread while preserving staging capacity and ownership until join and drain.
+  - category: performance
+    text: >-
+      Assigned experimental TP-shared DSA Host KV receives to balanced consecutive
+      destination-block ranges instead of interleaved modulo ownership, preserving
+      source pairing and merging only byte-contiguous transfers.

@@ -1172,7 +1172,11 @@ class MooncakePullRecvingThread(threading.Thread):
         shared_pool = get_dsa_pd_shared_host_pool()
         if shared_pool is not None and shared_pool.contains(local_base_addr):
             local_block_groups, remote_block_groups = partition_shared_block_groups(
-                local_block_groups, remote_block_groups, shared_pool.rank, shared_pool.size
+                local_block_groups,
+                remote_block_groups,
+                shared_pool.rank,
+                shared_pool.size,
+                coalesce=local_block_stride == remote_block_stride == transfer_len,
             )
             if not local_block_groups:
                 return
