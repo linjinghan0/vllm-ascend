@@ -594,9 +594,9 @@ def test_multi_head_fa_uses_tp_transfer_with_global_dcp() -> None:
         remote_dcp_size=2,
         transfer_entries_by_layer=entries,
         remote_metadata=remote,
-        src_list=src,
-        dst_list=dst,
-        length_list=lengths,
+        local_destinations=src,
+        remote_sources=dst,
+        lengths=lengths,
     )
     assert (src, dst, lengths) == ([2280], [8560], [256])
 
@@ -922,9 +922,9 @@ def test_attention_address_generation_handles_partial_head_overlap() -> None:
         remote_dcp_size=1,
         transfer_entries_by_layer={(0, 0): [("request", [1], [2])]},
         remote_metadata=remote,
-        src_list=src,
-        dst_list=dst,
-        length_list=lengths,
+        local_destinations=src,
+        remote_sources=dst,
+        lengths=lengths,
     )
 
     assert src == [1000 + 128 + 64]
@@ -1000,9 +1000,9 @@ def test_execute_bucket_calls_mooncake_and_raises_on_negative_return() -> None:
     thread = make_thread(engine=MagicMock())
     thread._append_spec_transfer_addresses = MagicMock(  # type: ignore[method-assign]
         side_effect=lambda **kwargs: (
-            kwargs["src_list"].append(1000),
-            kwargs["dst_list"].append(2000),
-            kwargs["length_list"].append(128),
+            kwargs["local_destinations"].append(1000),
+            kwargs["remote_sources"].append(2000),
+            kwargs["lengths"].append(128),
         )
     )
     remote = make_pp_metadata()
@@ -1454,9 +1454,9 @@ def test_mamba_unequal_tp_slices_conv_projections_and_state(remote_pcp: bool) ->
         remote_tp_size=1 if remote_pcp else 2,
         transfer_entries_by_layer={(0, 0): [("request", [1], [2])]},
         remote_metadata=remote,
-        src_list=src,
-        dst_list=dst,
-        length_list=lengths,
+        local_destinations=src,
+        remote_sources=dst,
+        lengths=lengths,
     )
 
     assert src == [1104, 1136, 1168, 1116, 1148, 1180, 1124, 1156, 1188, 2096]
@@ -1659,9 +1659,9 @@ def test_mamba_unequal_tp_slices_into_wider_remote_cache(local_pcp: bool) -> Non
         remote_tp_size=1,
         transfer_entries_by_layer={(0, 0): [("request", [1], [2])]},
         remote_metadata=remote,
-        src_list=src,
-        dst_list=dst,
-        length_list=lengths,
+        local_destinations=src,
+        remote_sources=dst,
+        lengths=lengths,
     )
 
     assert src == [1048, 1064, 1080, 1056, 1072, 1088, 1060, 1076, 1092, 2032]

@@ -100,6 +100,8 @@ def make_case(namespace, blocks, requests, fragmented, targets):
     pool = SimpleNamespace(rank=3, size=TP_SIZE, contains=lambda address: address in host_bases)
     # Historical revisions use the global hook; current code receives the view explicitly.
     namespace["get_dsa_pd_shared_host_pool"] = lambda: pool
+    thread._sfa_host_kv = pool
+    # Earlier revisions used this attribute for the same adapter.
     thread._shared_host_pool = pool
     peer = SimpleNamespace(kv_caches_base_addr=remote_bases)
     remote = SimpleNamespace(

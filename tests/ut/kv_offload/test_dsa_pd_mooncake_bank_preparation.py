@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import staging as staging_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import transfer_targets as registry_module
 
 from .test_dsa_pd_mooncake_connector_v2 import make_reader
@@ -34,7 +33,7 @@ class DelayedLanding:
 
     def __init__(self, monkeypatch, reader):
         self.reader = reader
-        self.original_copy = reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv
+        self.original_copy = reader.host_kv.manager.copy_sfa_kv
         self.current = None
         self.pending = {id(stream): [] for stream in reader._landing_streams}
         self.events = []
@@ -65,16 +64,15 @@ class DelayedLanding:
             finally:
                 self.current = None
 
-        def submit(*args, **kwargs):
+        def submit(*args):
             assert threading.get_ident() == self.caller
-            bank = kwargs["bank"]
             if self.current is None:
                 assert reader._get_dsa_pd_mooncake_staging_window() < 2
-                self.original_copy(*args, **kwargs)
+                self.original_copy(*args)
                 return
-            assert self.current is bank.stream
+            bank = next(bank for bank in reader._dsa_pd_mooncake_staging_banks if bank.stream is self.current)
             self.copy_banks.append(bank)
-            self.pending[id(bank.stream)].append(lambda: self.original_copy(*args, **kwargs))
+            self.pending[id(bank.stream)].append(lambda: self.original_copy(*args))
 
         for stream in reader._landing_streams:
 
@@ -86,7 +84,7 @@ class DelayedLanding:
             stream.synchronize.side_effect = synchronize
         monkeypatch.setattr(torch.npu, "stream", stream_context)
         monkeypatch.setattr(torch.npu, "Event", Event)
-        reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = submit
+        reader.host_kv.manager.copy_sfa_kv = submit
 
 
 @pytest.mark.parametrize("banks,window", [(1, 1), (1, 4), (2, 4), (4, 4), (4, 5), (8, 4)])
@@ -157,41 +155,14 @@ def test_serial_bank_batches_preserve_bytes_with_delayed_events(monkeypatch, ban
 
 
 @pytest.mark.parametrize("banks", [1, 2, 4, 3, 257])
-def test_bank_cache_budget_and_context_lifetime_are_bounded(banks):
+def test_bank_contexts_reuse_streams_and_events(banks):
     reader = make_reader(MagicMock(), kv_registry=registry)
     reader._landing_streams = [MagicMock() for _ in range(banks)]
     contexts = reader._get_dsa_pd_mooncake_staging_banks(banks, 1, True)
     assert [bank.slot_base for bank in contexts] == list(range(banks))
     assert all(bank.completion_event is None and not bank.completion_pending for bank in contexts)
-    views = [bank.views for bank in contexts if bank.views is not None]
-    assert len({id(cache) for cache in views}) == len(views)
-    assert sum(cache.capacity for cache in views) == staging_module._DSA_PD_MOONCAKE_LANDING_VIEW_CACHE_SIZE
-    assert reader._dsa_pd_mooncake_landing_views is contexts[0].views
+    assert [bank.stream for bank in contexts] == reader._landing_streams
     assert reader._get_dsa_pd_mooncake_staging_banks(banks, 1, True) is contexts
-    tensor = torch.zeros(32, dtype=torch.int8)
-    for cache in views:
-        for offset in range(cache.capacity + 1):
-            cache.get(tensor, offset % 16, 1, source=True)
-            cache.get(tensor, offset % 16, 1)
-    assert sum(len(cache._views) for cache in views) <= 256
-    assert sum(len(cache._recent) for cache in views) <= 256
-    tensor_ref = weakref.ref(tensor)
-    del tensor
-    gc.collect()
-    assert tensor_ref() is None and not any(cache._views for cache in views)
-
-
-def test_uncached_bank_does_not_fall_back_to_another_banks_cache():
-    reader = make_reader(MagicMock(), kv_registry=registry)
-    reader._landing_streams = [MagicMock() for _ in range(257)]
-    banks = reader._get_dsa_pd_mooncake_staging_banks(257, 1, True)
-    host, source = torch.zeros(16, dtype=torch.int8), torch.ones(16, dtype=torch.int8)
-    assert banks[-1].views is None
-    reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
-        host.data_ptr(), 16, staging=source, target_bytes=host, bank=banks[-1]
-    )
-    assert torch.equal(host, source)
-    assert not banks[0].views._views and not banks[0].views._recent
 
 
 def test_layout_change_drains_previous_bank_events_before_replacement():
@@ -335,14 +306,14 @@ def test_bank_failure_drains_submitted_bytes_before_unlock(monkeypatch, failure)
 
     reader.engine.batch_transfer_sync_read.side_effect = read
     if failure == "copy_exception":
-        original = reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv
+        original = reader.host_kv.manager.copy_sfa_kv
 
         def copy(*args, **kwargs):
             original(*args, **kwargs)
             if reads == 2:
                 raise RuntimeError("copy failed")
 
-        reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = copy
+        reader.host_kv.manager.copy_sfa_kv = copy
     elif failure == "event_record":
         event_type = torch.npu.Event
 

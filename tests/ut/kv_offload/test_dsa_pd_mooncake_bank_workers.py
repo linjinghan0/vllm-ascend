@@ -55,7 +55,7 @@ class BankRuntime:
         self.wait_hook = None
         self.barrier = threading.Barrier(min(workers, banks, batches)) if workers else None
         self.queues = [[] for _ in range(banks)]
-        self.copy = reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv
+        self.copy = reader.host_kv.manager.copy_sfa_kv
         runtime = self
 
         class Stream:
@@ -111,11 +111,16 @@ class BankRuntime:
             finally:
                 self.local.stream = None
 
-        def submit_copy(*args, **kwargs):
-            bank = kwargs["bank"]
-            assert self.local.stream in (bank.copy_streams or (bank.stream,))
-            self.copy_submissions.append((bank.stream.index, self.local.stream.index, threading.get_ident()))
-            self.queues[self.local.stream.index].append(lambda: self.copy(*args, **kwargs))
+        def submit_copy(*args):
+            bank = self.local.bank
+            stream = getattr(self.local, "stream", None)
+            if stream is None:
+                self.copy(*args)
+                return
+            assert stream in (bank.copy_streams or (bank.stream,))
+            for _ in range(args[0].numel()):
+                self.copy_submissions.append((bank.stream.index, stream.index, threading.get_ident()))
+            self.queues[stream.index].append(lambda: self.copy(*args))
             if self.copy_hook is not None:
                 self.copy_hook(bank.stream.index)
 
@@ -129,9 +134,11 @@ class BankRuntime:
                 assert batch.bank_index not in self.bank_owners
                 self.bank_owners.add(batch.bank_index)
                 self.batch_threads.append((batch.bank_index, threading.current_thread()))
+            self.local.bank = bank
             try:
                 return execute(session, bank, batch, *args)
             finally:
+                self.local.bank = None
                 with self.lock:
                     self.bank_owners.remove(batch.bank_index)
 
@@ -143,7 +150,7 @@ class BankRuntime:
 
         reader._landing_streams = [Stream(index) for index in range(banks)]
         reader._landing_stream = reader._landing_streams[0]
-        reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = submit_copy
+        reader.host_kv.manager.copy_sfa_kv = submit_copy
         reader._execute_dsa_pd_mooncake_bank_batch = owned_execute
         reader._ensure_dsa_pd_mooncake_staging_tensor = frozen_allocation
         monkeypatch.setattr(torch.npu, "set_device", set_device)
@@ -212,8 +219,6 @@ def build(monkeypatch, workers=None, count=37, metadata=True, banks=BANKS, windo
     bank_window = window // active_banks
     batches = (count + bank_window - 1) // bank_window
     runtime = BankRuntime(monkeypatch, reader, expected_workers, batches, active_banks, window)
-    if window < 2:
-        reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = runtime.copy
     kwargs = {}
     if metadata:
         table = registry.create_transfer_targets([[host]])
@@ -255,7 +260,6 @@ def test_worker_counts_preserve_bytes_geometry_and_exclusive_bank_ownership(monk
     assert case.runtime.peak_reads == (min(workers, BANKS, len(reads)) if workers else 1)
     assert len(case.runtime.threads) <= min(workers, BANKS)
     assert case.reader._dsa_pd_mooncake_staging_bytes == WINDOW * ALIGNMENT
-    assert sum(bank.views.capacity for bank in case.reader._dsa_pd_mooncake_staging_banks) == 256
     case.runtime.assert_drained()
 
 
@@ -380,7 +384,7 @@ def test_failure_waits_for_other_bank_and_drains_before_unlock(monkeypatch, fail
 
 
 @pytest.mark.parametrize("workers", [1, 2, 4])
-def test_repeated_requests_reuse_views_with_fresh_payloads(monkeypatch, workers):
+def test_repeated_requests_reuse_banks_with_fresh_payloads(monkeypatch, workers):
     case = build(monkeypatch, workers)
     contexts = None
     for value in range(1, 7):
@@ -392,7 +396,6 @@ def test_repeated_requests_reuse_views_with_fresh_payloads(monkeypatch, workers)
         assert case.reader._dsa_pd_mooncake_staging_banks is contexts
         for index in range(case.count):
             assert torch.all(case.host[index * HOST_STRIDE + 16 : index * HOST_STRIDE + 16 + PIECE_BYTES] == value)
-        assert sum(len(bank.views._views) for bank in contexts) <= 256
         case.runtime.assert_drained()
 
 
@@ -479,8 +482,6 @@ def test_worker_setting_retains_serial_fallbacks(monkeypatch, reason):
         monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
     else:
         case.reader._pipeline_landing_enabled = False
-        # The synchronous fallback does not enter a landing stream context.
-        case.reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = case.runtime.copy
     assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
     assert not case.runtime.threads and case.runtime.peak_reads == 1
     assert [pointer for row in case.runtime.reads for pointer in row[3]] == case.args[2]
@@ -583,7 +584,6 @@ def test_automatic_workers_retain_serial_fallbacks(monkeypatch, reason):
         monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
     else:
         case.reader._pipeline_landing_enabled = False
-        case.reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = case.runtime.copy
     assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
     assert not case.runtime.threads and case.runtime.peak_reads == 1
     case.runtime.assert_drained()

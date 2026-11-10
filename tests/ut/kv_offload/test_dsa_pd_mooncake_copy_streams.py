@@ -51,7 +51,6 @@ def test_stream_counts_preserve_bytes_batching_workers_and_reuse(monkeypatch, st
     assert len(case.runtime.reads) == 2 * 10
     assert len(case.runtime.events) == BANKS * min(streams, 4)
     assert BANKS <= len(case.runtime.threads) <= 2 * BANKS
-    assert sum(bank.views.capacity for bank in contexts) == 256
 
 
 def test_stream_configuration_changes_only_after_prior_copies_drain(monkeypatch):
@@ -111,7 +110,6 @@ def test_disabled_pipeline_and_probe_keep_one_copy_stream(monkeypatch, reason):
         monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
     else:
         case.reader._pipeline_landing_enabled = False
-        case.reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = case.runtime.copy
     assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
     assert all(len(bank.copy_streams) == 1 for bank in case.reader._dsa_pd_mooncake_staging_banks)
     assert_bytes(case)
@@ -149,7 +147,7 @@ def test_failed_stream_drain_still_drains_peers_and_retains_tensor_owners():
     second = MagicMock()
     owner = torch.empty(16)
     bank = staging._DSAPDMooncakeStagingBank(
-        0, 4, first, None, copy_streams=(first, second), needs_stream_drain=True, inflight_owners=[(owner,)]
+        0, 4, first, copy_streams=(first, second), needs_stream_drain=True, inflight_owners=[(owner,)]
     )
     reader = staging.MooncakeSFAStagingReader.__new__(staging.MooncakeSFAStagingReader)
     with pytest.raises(RuntimeError, match="stream drain failed"):

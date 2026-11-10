@@ -13,6 +13,7 @@ import json
 import os
 import time
 from pathlib import Path
+from runpy import run_path
 from typing import Any
 
 import torch
@@ -27,7 +28,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullRecvingThread
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 
 
@@ -57,26 +57,21 @@ def producer(args: argparse.Namespace, engine: Any) -> None:
 
 
 def consumer(args: argparse.Namespace, engine: Any) -> None:
+    make_smoke_host_kv = run_path(str(Path(__file__).with_name("dsa_mooncake_staging_smoke_main.py")))[
+        "make_smoke_host_kv"
+    ]
     remote = json.loads(args.metadata.read_text())
     block = 256
     if args.nbytes % block:
         raise ValueError("nbytes must be a multiple of 256")
-    # This standalone byte probe owns a CPU fixture, not a serving Host pool.
-    host = torch.empty(args.nbytes, dtype=torch.int8, pin_memory=True)
-    registry = MooncakeKVRegistry()
-    storage = host.untyped_storage()
-    registry.register_cpu_buffer(storage.data_ptr(), storage.nbytes())
-    registry.register_offloaded_tensor(host)
-    hbm = torch.zeros(128 * 1024, dtype=torch.int8, device="npu")
-    global_te.register_buffer([hbm.data_ptr()], [hbm.nbytes])
-    # This byte fixture bypasses the serving Host adapter but uses the same
-    # staging initialization and execution as the concrete SFA reader.
-    reader = MooncakeSFAStagingReader.__new__(MooncakeSFAStagingReader)
-    reader.engine, reader.host_kv = engine, None
-    reader.kv_registry = registry
-    reader.kv_caches = {"host": host, "hbm": hbm}
-    reader.block_len_per_addr = [[block], [block]]
-    reader._init_dsa_pd_mooncake_staging()
+    host_kv, host = make_smoke_host_kv(args.nbytes, layer_name="model.layers.0.self_attn", store_port=args.offload_port)
+    alignment = 2 * 1024 * 1024
+    hbm_storage = torch.zeros(2 * alignment, dtype=torch.int8, device="npu")
+    offset = (-hbm_storage.data_ptr()) % alignment
+    hbm_region = hbm_storage[offset : offset + alignment]
+    hbm = hbm_region[: 128 * 1024]
+    global_te.register_buffer([hbm_region.data_ptr()], [hbm_region.nbytes])
+    reader = MooncakeSFAStagingReader(engine, host_kv, [[block], [block]])
     thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
     thread.engine, thread.staging_reader = engine, reader
     thread.tp_rank = thread.pcp_rank = thread.dcp_rank = 0
@@ -155,7 +150,8 @@ def consumer(args: argparse.Namespace, engine: Any) -> None:
     result = {
         "role": "consumer",
         "connector": "MooncakeConnectorV2",
-        "allocator": "ModelRunnerV2 DSA Host KV",
+        "allocator": "SparseKVOffloadManager byte fixture",
+        "copy_mode": "manager_sparse_copy",
         "target_metadata": thread._transfer_targets is not None,
         "host_ok": host_ok,
         "hbm_ok": hbm_ok,
@@ -182,9 +178,11 @@ def main() -> None:
     parser.add_argument("--done", type=Path, required=True)
     parser.add_argument("--nbytes", type=int, default=9 * 1024 * 1024 + 128 * 1024)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--device-name", default=None)
+    parser.add_argument("--offload-port", type=int, default=8500)
     args = parser.parse_args()
     torch.npu.set_device(args.device)
-    engine = global_te.get_transfer_engine(args.hostname, None)
+    engine = global_te.get_transfer_engine(args.hostname, args.device_name)
     if args.role == "producer":
         producer(args, engine)
     else:

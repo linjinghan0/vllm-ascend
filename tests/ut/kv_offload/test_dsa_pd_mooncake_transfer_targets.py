@@ -33,7 +33,12 @@ def reset_registry(monkeypatch):
     registry.clear()
 
 
-def forbid_address_queries(monkeypatch):
+def forbid_address_queries(monkeypatch, reader=None):
+    if reader is not None:
+        # Isolate reader address discovery from the Host adapter's separate
+        # landing range guard, which must still validate the original registry.
+        resolve = registry.resolve_offloaded_tensor
+        monkeypatch.setattr(reader.host_kv, "contains", lambda ptr, size=1: resolve(ptr, size) is not None)
     for name in ["resolve_offloaded_tensor", "resolve_offloaded_byte_tensor", "get_register_location"]:
         monkeypatch.setattr(
             registry,
@@ -186,7 +191,7 @@ def test_native_bucket_carries_targets_and_copies_bytes_without_queries(monkeypa
         return 0
 
     engine.batch_transfer_sync_read.side_effect = read
-    forbid_address_queries(monkeypatch)
+    forbid_address_queries(monkeypatch, reader)
     thread._execute_tp_transfer_bucket(0, 0, 0, 1, 1, 1, remote, entries)
     assert torch.equal(host[128:384], source[384:640])
     assert torch.equal(direct[128:384], source[384:640])
@@ -237,7 +242,7 @@ def test_direct_only_metadata_avoids_staging_lock_and_queries(monkeypatch):
     reader = make_reader(MagicMock(), kv_registry=registry)
     targets = registry.create_transfer_targets([[tensor]])[0]
     reader.engine.batch_transfer_sync_read.side_effect = lambda *_: int(reader._dsa_pd_mooncake_staging_lock.locked())
-    forbid_address_queries(monkeypatch)
+    forbid_address_queries(monkeypatch, reader)
     assert (
         reader.batch_transfer_sync_read("peer", [tensor.data_ptr()], [1024], [16], "direct", transfer_targets=targets)
         == 0
@@ -265,16 +270,16 @@ def test_tagged_pipeline_drains_on_failure(monkeypatch, failure):
     reader = make_reader(MagicMock(), pipeline=True, window=2, kv_registry=registry)
     event = MagicMock()
     monkeypatch.setattr(torch.npu, "Event", MagicMock(return_value=event))
-    reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = MagicMock()
+    reader.host_kv.manager.copy_sfa_kv = MagicMock()
     if failure == "copy_exception":
         reader.engine.batch_transfer_sync_read.return_value = 0
-        reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv.side_effect = [None, RuntimeError("copy failed")]
+        reader.host_kv.manager.copy_sfa_kv.side_effect = [None, RuntimeError("copy failed")]
     else:
         reader.engine.batch_transfer_sync_read.side_effect = [
             0,
             -1 if failure == "negative" else RuntimeError("read failed"),
         ]
-    forbid_address_queries(monkeypatch)
+    forbid_address_queries(monkeypatch, reader)
     if failure == "negative":
         assert (
             reader.batch_transfer_sync_read(
@@ -318,7 +323,7 @@ def test_interleaved_destinations_use_identity_instead_of_input_position(monkeyp
         return 0
 
     reader.engine.batch_transfer_sync_read.side_effect = read
-    forbid_address_queries(monkeypatch)
+    forbid_address_queries(monkeypatch, reader)
     assert (
         reader.batch_transfer_sync_read(
             "peer",
@@ -335,6 +340,6 @@ def test_interleaved_destinations_use_identity_instead_of_input_position(monkeyp
 
 def test_empty_tagged_receive_performs_no_read_or_query(monkeypatch):
     reader = make_reader(MagicMock(), kv_registry=registry)
-    forbid_address_queries(monkeypatch)
+    forbid_address_queries(monkeypatch, reader)
     assert reader.batch_transfer_sync_read("peer", [], [], [], "empty", transfer_targets=[]) == 0
     reader.engine.batch_transfer_sync_read.assert_not_called()

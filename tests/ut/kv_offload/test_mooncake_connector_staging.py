@@ -22,12 +22,14 @@ from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     GlobalTE,
 )
 
+from .test_dsa_pd_mooncake_connector_v2 import make_host
+
 
 def _make_fake_recv_thread(staging_chunk_bytes: int) -> MooncakeSFAStagingReader:
     thread = object.__new__(MooncakeSFAStagingReader)
     thread.engine = MagicMock()
-    thread.host_kv = None
     thread.kv_registry = MooncakeKVRegistry()
+    thread.host_kv = make_host(thread.kv_registry)
     thread.kv_caches = {}
     thread.block_len_per_addr = [[int(staging_chunk_bytes)]]
     thread._dsa_pd_mooncake_staging_storage = None
@@ -58,14 +60,15 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
         self.thread._get_dsa_pd_mooncake_staging_chunk_bytes = lambda: self.staging_chunk_bytes
         self.thread._get_dsa_pd_mooncake_staging_window = lambda: 1
 
-        def record_copy(dst: int, length: int, staging_offset: int = 0, **_prepared: object) -> None:
-            copied.append((dst, length, staging_offset))
+        def record_copy(sources, destinations, lengths, count) -> None:
+            for src, dst, length in zip(sources.tolist(), destinations.tolist(), lengths.tolist()):
+                copied.append((dst, length, src - staging.data_ptr()))
 
-        self.thread._copy_dsa_pd_mooncake_staging_to_offloaded_kv = record_copy
+        self.thread.host_kv.manager.copy_sfa_kv = record_copy
         self.thread.engine.batch_transfer_sync_read.return_value = 0
         remote_base_addr = 0xA00000
 
-        ret = self.thread._batch_transfer_sync_read_with_optional_staging(
+        ret = self.thread.batch_transfer_sync_read(
             "remote:7777",
             [offloaded_kv.data_ptr()],
             [remote_base_addr],
@@ -107,7 +110,7 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
         self.thread._get_dsa_pd_mooncake_staging_window = lambda: 4
         self.thread.engine.batch_transfer_sync_read.return_value = 0
 
-        ret = self.thread._batch_transfer_sync_read_with_optional_staging(
+        ret = self.thread.batch_transfer_sync_read(
             "remote:7777",
             [offloaded_kv.data_ptr()],
             [0xA00000],
@@ -129,7 +132,7 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
             return 0
 
         self.thread._batch_transfer_sync_read_with_optional_staging_unlocked = assert_lock_held
-        ret = self.thread._batch_transfer_sync_read_with_optional_staging(
+        ret = self.thread.batch_transfer_sync_read(
             "remote:7777",
             [offloaded_kv.data_ptr()],
             [0xA00000],
@@ -186,7 +189,7 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
 
         self.thread.engine.batch_transfer_sync_read.side_effect = record_read
 
-        ret = self.thread._batch_transfer_sync_read_with_optional_staging(
+        ret = self.thread.batch_transfer_sync_read(
             "remote:7777",
             [offloaded_kv.data_ptr()],
             [0xA00000],
@@ -277,7 +280,7 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
         self.thread._pipeline_landing_enabled = True
         self.thread.engine.batch_transfer_sync_read.return_value = 0
 
-        ret = self.thread._batch_transfer_sync_read_with_optional_staging(
+        ret = self.thread.batch_transfer_sync_read(
             "remote:7777",
             [offloaded_kv.data_ptr()],
             [0xA00000],
@@ -313,12 +316,13 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
         self.thread._landing_streams = [self.thread._landing_stream]
         self.thread.engine.batch_transfer_sync_read.return_value = 0
 
-        def record_copy(dst: int, length: int, staging_offset: int = 0, **_prepared: object) -> None:
-            copied.append((dst, length, staging_offset))
+        def record_copy(sources, destinations, lengths, count) -> None:
+            for src, dst, length in zip(sources.tolist(), destinations.tolist(), lengths.tolist()):
+                copied.append((dst, length, src - staging.data_ptr()))
 
-        self.thread._copy_dsa_pd_mooncake_staging_to_offloaded_kv = record_copy
+        self.thread.host_kv.manager.copy_sfa_kv = record_copy
 
-        ret = self.thread._batch_transfer_sync_read_with_optional_staging(
+        ret = self.thread.batch_transfer_sync_read(
             "remote:7777",
             [offloaded_kv.data_ptr()],
             [0xA00000],
@@ -363,7 +367,7 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
         self.thread._get_dsa_pd_mooncake_staging_window = lambda: 4
         self.thread.engine.batch_transfer_sync_read.return_value = 0
 
-        ret = self.thread._batch_transfer_sync_read_with_optional_staging(
+        ret = self.thread.batch_transfer_sync_read(
             "remote:7777",
             [offloaded_kv.data_ptr()],
             [0xA00000],
@@ -403,10 +407,11 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
 
         copied: list[tuple[int, int, int]] = []
 
-        def record_copy(dst: int, length: int, staging_offset: int = 0, **_prepared: object) -> None:
-            copied.append((dst, length, staging_offset))
+        def record_copy(sources, destinations, lengths, count) -> None:
+            for src, dst, length in zip(sources.tolist(), destinations.tolist(), lengths.tolist()):
+                copied.append((dst, length, src - staging.data_ptr()))
 
-        self.thread._copy_dsa_pd_mooncake_staging_to_offloaded_kv = record_copy
+        self.thread.host_kv.manager.copy_sfa_kv = record_copy
 
         # Trace the interleaving of network reads, event records and event
         # waits to pin down the pipelining discipline.
@@ -427,7 +432,7 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
 
         self.thread.engine.batch_transfer_sync_read.side_effect = record_read
 
-        ret = self.thread._batch_transfer_sync_read_with_optional_staging(
+        ret = self.thread.batch_transfer_sync_read(
             "remote:7777",
             [offloaded_kv.data_ptr()],
             [0xA00000],

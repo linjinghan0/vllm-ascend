@@ -192,7 +192,7 @@ def test_main_blocks_are_partitioned_once_while_indexer_stays_replicated(tp_size
         manager, caches = make_manager(rank=rank, size=tp_size)
         host = MooncakeSFAHostKV(manager, caches)
         thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
-        thread._shared_host_pool = host
+        thread._sfa_host_kv = host
         ownership = {}
         for tensor in host.transfer_caches[MAIN]:
             src, dst, lengths = [], [], []
@@ -204,11 +204,11 @@ def test_main_blocks_are_partitioned_once_while_indexer_stays_replicated(tp_size
                 local_block_stride=16,
                 remote_block_stride=16,
                 transfer_len=16,
-                src_list=src,
-                dst_list=dst,
-                length_list=lengths,
+                local_destinations=src,
+                remote_sources=dst,
+                lengths=lengths,
                 shared_block_groups=ownership,
-                shared_host_pool=host,
+                host_kv=host,
             )
             all_main.append(sum(lengths))
         assert len(ownership) == 1
@@ -221,11 +221,11 @@ def test_main_blocks_are_partitioned_once_while_indexer_stays_replicated(tp_size
             local_block_stride=16,
             remote_block_stride=16,
             transfer_len=16,
-            src_list=src,
-            dst_list=dst,
-            length_list=lengths,
+            local_destinations=src,
+            remote_sources=dst,
+            lengths=lengths,
             shared_block_groups=ownership,
-            shared_host_pool=host,
+            host_kv=host,
         )
         assert lengths == [64]
     assert sum(all_main) == 2 * 4 * 16
@@ -483,7 +483,7 @@ def test_real_bucket_direct_hbm_and_host_landing_share_completion(tokens, pipeli
         remote_block_ids=([], blocks),
     )
     thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
-    thread.staging_reader, thread.engine, thread._shared_host_pool = reader, engine, host
+    thread.staging_reader, thread.engine, thread._sfa_host_kv = reader, engine, host
     thread._transfer_targets = [host.registry.create_transfer_targets([list(host.transfer_caches[MAIN])])[0]]
     thread.kv_cache_specs = [manager.kv_cache_config.kv_cache_groups[1].kv_cache_spec]
     thread.layer_names = [MAIN]

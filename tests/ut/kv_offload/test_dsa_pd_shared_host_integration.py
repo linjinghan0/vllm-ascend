@@ -20,7 +20,7 @@ class TestSharedHostIntegration(TestCase):
             local,
             remote,
             lengths,
-            shared_host_pool=pool,
+            host_kv=pool,
         )
         self.assertEqual(local, [1024 + 6 * 128])
         self.assertEqual(remote, [100000 + 26 * 128])
@@ -44,7 +44,7 @@ class TestSharedHostIntegration(TestCase):
                     lengths,
                     local_inner_offset=16,
                     remote_inner_offset=32,
-                    shared_host_pool=pool,
+                    host_kv=pool,
                 )
                 self.assertEqual(local, [1024 + i * local_stride + 16 for i in (3, 4, 5)])
                 self.assertEqual(remote, [100000 + i * remote_stride + 32 for i in (23, 24, 25)])
@@ -54,7 +54,7 @@ class TestSharedHostIntegration(TestCase):
         pool = SimpleNamespace(rank=7, size=8, contains=lambda ptr: ptr == 1024)
         local, remote, lengths = [], [], []
         MooncakePullRecvingThread._append_block_transfer_addresses(
-            [[1, 2]], [[10, 11]], 1024, 100000, 128, 128, 128, local, remote, lengths, shared_host_pool=pool
+            [[1, 2]], [[10, 11]], 1024, 100000, 128, 128, 128, local, remote, lengths, host_kv=pool
         )
         self.assertEqual((local, remote, lengths), ([], [], []))
 
@@ -72,6 +72,6 @@ class TestSharedHostIntegration(TestCase):
             local,
             remote,
             lengths,
-            shared_host_pool=pool,
+            host_kv=pool,
         )
         self.assertEqual((local, remote, lengths), ([1024], [100000 + 20 * 128], [16 * 128]))

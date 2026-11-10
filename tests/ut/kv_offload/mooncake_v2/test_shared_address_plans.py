@@ -72,7 +72,7 @@ def test_shared_plans_preserve_addresses_and_targets_across_layers(rank, layout,
     host_bases = {base for layer in local_bases[:2] for base in layer}
     pool = SimpleNamespace(rank=rank, size=4, contains=lambda ptr: ptr in host_bases)
     src, dst, lengths, actual_targets = [], [], [], []
-    thread._shared_host_pool = pool
+    thread._sfa_host_kv = pool
     with (
         patch.object(
             pull_worker, "partition_shared_block_groups", wraps=pull_worker.partition_shared_block_groups
@@ -131,7 +131,7 @@ def test_shared_plan_is_rebuilt_for_changed_request_mapping_and_tp_owner():
         tp_base_addrs={0: [[100000], [200000]]},
     )
     pool = SimpleNamespace(rank=0, size=2, contains=lambda ptr: True)
-    thread._shared_host_pool = pool
+    thread._sfa_host_kv = pool
     with (
         patch.object(
             pull_worker, "partition_shared_block_groups", wraps=pull_worker.partition_shared_block_groups

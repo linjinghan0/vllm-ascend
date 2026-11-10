@@ -13,8 +13,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from vllm_ascend import envs
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import staging as staging_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import transfer_targets as registry_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import MooncakeSFAHostKV
 
 from .mooncake_v2.helpers import make_pp_metadata
 from .mooncake_v2.test_pull_worker import make_thread
@@ -34,11 +37,29 @@ def clear_registry(monkeypatch):
     registry.clear()
 
 
+def make_host(kv_registry):
+    # Byte fixtures need only registered ranges and a CPU implementation of the
+    # Manager copy interface. Keep the real Host adapter's landing/ABI checks.
+    host = MooncakeSFAHostKV.__new__(MooncakeSFAHostKV)
+    host.registry = kv_registry
+    host.transfer_caches = {}
+
+    def copy_bytes(sources, destinations, lengths, count):
+        assert sources.dtype == destinations.dtype == torch.int64
+        assert lengths.dtype == count.dtype == torch.int32
+        assert count.tolist() == [sources.numel()] == [destinations.numel()] == [lengths.numel()]
+        for src, dst, length in zip(sources.tolist(), destinations.tolist(), lengths.tolist()):
+            ctypes.memmove(dst, src, length)
+
+    host.manager = SimpleNamespace(copy_sfa_kv=copy_bytes)
+    return host
+
+
 def make_reader(engine, *, pipeline=False, window=2, bank_workers=0, kv_registry=None):
     reader = MooncakeSFAStagingReader.__new__(MooncakeSFAStagingReader)
     reader.engine = engine
-    reader.host_kv = None
     reader.kv_registry = kv_registry if kv_registry is not None else registry_module.MooncakeKVRegistry()
+    reader.host_kv = make_host(reader.kv_registry)
     reader.kv_caches = {}
     reader.block_len_per_addr = [[128]]
     reader._dsa_pd_mooncake_staging_lock = threading.Lock()
@@ -66,26 +87,10 @@ def test_readers_receive_independent_registry_instances(monkeypatch):
     right_host = SimpleNamespace(transfer_caches={}, registry=right_registry)
     left = MooncakeSFAStagingReader(MagicMock(), left_host, [[128]])
     right = MooncakeSFAStagingReader(MagicMock(), right_host, [[128]])
-    assert left._resolve_host_tensor(target.data_ptr(), target.nbytes)[0] is target
-    assert right._resolve_host_tensor(target.data_ptr(), target.nbytes) is None
+    assert left.kv_registry.resolve_offloaded_tensor(target.data_ptr(), target.nbytes)[0] is target
+    assert right.kv_registry.resolve_offloaded_tensor(target.data_ptr(), target.nbytes) is None
     right_registry.clear()
-    assert left._resolve_host_tensor(target.data_ptr(), target.nbytes)[0] is target
-
-
-def test_prepared_copy_uses_supplied_staging_and_byte_view(monkeypatch):
-    reader = make_reader(MagicMock(), kv_registry=registry)
-    target = torch.zeros(64, dtype=torch.int8)
-    staging = torch.arange(32, dtype=torch.int8)
-    reader._ensure_dsa_pd_mooncake_staging_tensor = MagicMock(side_effect=AssertionError("rechecked staging"))
-    monkeypatch.setattr(
-        registry, "resolve_offloaded_tensor", MagicMock(side_effect=AssertionError("resolved target twice"))
-    )
-    reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv(
-        target.data_ptr() + 8, 12, 4, staging=staging, target_bytes=target, target_offset=8
-    )
-    assert torch.equal(target[8:20], staging[4:16])
-    assert torch.count_nonzero(target[:8]) == 0
-    assert torch.count_nonzero(target[20:]) == 0
+    assert left.kv_registry.resolve_offloaded_tensor(target.data_ptr(), target.nbytes)[0] is target
 
 
 @pytest.mark.parametrize("pipeline", [False, True])
@@ -210,10 +215,10 @@ def test_pipeline_drains_before_releasing_staging_on_failure(monkeypatch, failur
     reader = make_reader(engine, pipeline=True, kv_registry=registry)
     event = MagicMock()
     monkeypatch.setattr(torch.npu, "Event", MagicMock(return_value=event))
-    reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = MagicMock()
+    reader.host_kv.manager.copy_sfa_kv = MagicMock()
     if failure == "copy_exception":
         engine.batch_transfer_sync_read.return_value = 0
-        reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv.side_effect = [None, RuntimeError("copy failed")]
+        reader.host_kv.manager.copy_sfa_kv.side_effect = [None, RuntimeError("copy failed")]
     else:
         engine.batch_transfer_sync_read.side_effect = [0, -1 if failure == "negative" else RuntimeError("read failed")]
     args = ("peer", [host.data_ptr()], [chunk * 10], [host.nbytes], "request")
@@ -243,7 +248,7 @@ def test_peer_bucket_cannot_overwrite_staging_during_landing():
         landing_entered.set()
         assert release_landing.wait(5)
 
-    reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = land
+    reader.host_kv.manager.copy_sfa_kv = land
     args = ("peer", [host.data_ptr()], [0xA00000], [128], "request")
 
     def second():
@@ -291,3 +296,34 @@ def test_receive_reuses_staging_for_every_landing(pipeline):
     assert reader.batch_transfer_sync_read("peer", [target.data_ptr()], [10 * chunk], [target.nbytes], "request") == 0
     reader._ensure_dsa_pd_mooncake_staging_tensor.assert_called_once()
     assert torch.all(target == 7)
+
+
+@pytest.mark.parametrize("read_result", [0, -7])
+def test_read_probe_only_synchronizes_successful_reads_before_landing(monkeypatch, read_result):
+    target = torch.empty(64, dtype=torch.int8)
+    registry.register_offloaded_tensor(target)
+    reader = make_reader(MagicMock(), pipeline=True, kv_registry=registry)
+    order = []
+
+    def read(*_args):
+        order.append("read")
+        return read_result
+
+    reader.engine.batch_transfer_sync_read.side_effect = read
+    reader.host_kv.manager.copy_sfa_kv = lambda *_args: order.append("land")
+    monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: order.append("probe"))
+    info, error = MagicMock(), MagicMock()
+    monkeypatch.setattr(staging_module.logger, "info", info)
+    monkeypatch.setattr(staging_module.logger, "error", error)
+
+    assert reader.batch_transfer_sync_read("peer", [target.data_ptr()], [0xA00000], [64], "probe") == read_result
+    assert order == (["read", "probe", "land"] if read_result == 0 else ["read"])
+    assert not reader._dsa_pd_mooncake_staging_lock.locked()
+    if read_result == 0:
+        info.assert_called_once()
+        assert info.call_args.args[3:7] == (1, 1, 1, 1)  # batches, chunks, copies, plan
+        error.assert_not_called()
+    else:
+        info.assert_not_called()
+        error.assert_called_once()

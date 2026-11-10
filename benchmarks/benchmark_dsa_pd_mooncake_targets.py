@@ -53,7 +53,7 @@ class _Engine:
 def _make_reader(reader_type):
     reader = reader_type.__new__(reader_type)
     reader.engine = _Engine()
-    reader.host_kv = None
+    reader.host_kv = SimpleNamespace(land=lambda *_args: None)
     reader.kv_registry = registry
     reader.kv_caches = {f"direct.{i}": torch.empty(1024 * 1024, dtype=torch.int8) for i in range(DIRECT_TENSORS)}
     for layer in range(LAYERS):
@@ -70,10 +70,11 @@ def _make_reader(reader_type):
     reader._dsa_pd_mooncake_staging_bytes = 16 * ALIGNMENT
     reader._pipeline_landing_enabled = True
     reader._pipeline_banks = 2
+    # Measure preparation on the caller, excluding executor scheduling costs.
+    reader._get_dsa_pd_mooncake_bank_workers = lambda _banks: 0
     reader._landing_streams = [SimpleNamespace(synchronize=lambda: None) for _ in range(2)]
     reader._landing_stream = reader._landing_streams[0]
     reader._get_dsa_pd_mooncake_staging_window = lambda: 16
-    reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = lambda *_args, **_kwargs: None
     return reader
 
 
@@ -84,11 +85,7 @@ def _counts(reader, operation):
         patch.object(book, "get_register_location", wraps=book.get_register_location) as locations,
         patch.object(book, "resolve_offloaded_byte_tensor", wraps=book.resolve_offloaded_byte_tensor) as views,
         patch.object(reader.engine, "batch_transfer_sync_read", wraps=reader.engine.batch_transfer_sync_read) as reads,
-        patch.object(
-            reader,
-            "_copy_dsa_pd_mooncake_staging_to_offloaded_kv",
-            wraps=reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv,
-        ) as copies,
+        patch.object(reader.host_kv, "land", wraps=reader.host_kv.land) as landings,
     ):
         assert operation() == 0
         return dict(
@@ -96,7 +93,7 @@ def _counts(reader, operation):
             cpu_location_queries=locations.call_count,
             byte_tensor_queries=views.call_count,
             read_batches=reads.call_count,
-            copies=copies.call_count,
+            copies=sum(len(call.args[0]) for call in landings.call_args_list),
         )
 
 
