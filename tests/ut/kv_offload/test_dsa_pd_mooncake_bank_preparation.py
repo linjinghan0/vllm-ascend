@@ -11,20 +11,22 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_ascend.kv_offload import dsa_pd_mooncake as registry
-from vllm_ascend.kv_offload import dsa_pd_mooncake_staging as staging_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import staging as staging_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import transfer_targets as registry_module
 
 from .test_dsa_pd_mooncake_connector_v2 import make_reader
+
+registry = registry_module.MooncakeKVRegistry()
 
 ALIGNMENT = 2 * 1024 * 1024
 
 
 @pytest.fixture(autouse=True)
 def reset_registry(monkeypatch):
-    registry.reset_dsa_pd_mooncake_kv_registries()
+    registry.clear()
     monkeypatch.setattr(torch.npu, "synchronize", MagicMock())
     yield
-    registry.reset_dsa_pd_mooncake_kv_registries()
+    registry.clear()
 
 
 class DelayedLanding:
@@ -99,8 +101,8 @@ def test_serial_bank_batches_preserve_bytes_with_delayed_events(monkeypatch, ban
     host_storage = torch.full((length + 26,), 251, dtype=torch.uint8)
     host = host_storage[13:-13]
     direct = torch.zeros(8, dtype=torch.uint8)
-    registry.register_dsa_pd_mooncake_offloaded_kv_tensor(host)
-    reader = make_reader(MagicMock(), pipeline=True, window=window)
+    registry.register_offloaded_tensor(host)
+    reader = make_reader(MagicMock(), pipeline=True, window=window, kv_registry=registry)
     reader._pipeline_banks = banks
     reader._landing_streams = [MagicMock() for _ in range(banks)]
     reader._landing_stream = reader._landing_streams[0]
@@ -118,7 +120,7 @@ def test_serial_bank_batches_preserve_bytes_with_delayed_events(monkeypatch, ban
     reader.engine.batch_transfer_sync_read.side_effect = read
     kwargs = {}
     if metadata:
-        table = registry.create_dsa_pd_mooncake_transfer_targets([[host], [direct]])
+        table = registry.create_transfer_targets([[host], [direct]])
         kwargs["transfer_targets"] = [table[0][0], table[1][0]]
     assert (
         reader.batch_transfer_sync_read(
@@ -156,7 +158,7 @@ def test_serial_bank_batches_preserve_bytes_with_delayed_events(monkeypatch, ban
 
 @pytest.mark.parametrize("banks", [1, 2, 4, 3, 257])
 def test_bank_cache_budget_and_context_lifetime_are_bounded(banks):
-    reader = make_reader(MagicMock())
+    reader = make_reader(MagicMock(), kv_registry=registry)
     reader._landing_streams = [MagicMock() for _ in range(banks)]
     contexts = reader._get_dsa_pd_mooncake_staging_banks(banks, 1, True)
     assert [bank.slot_base for bank in contexts] == list(range(banks))
@@ -180,7 +182,7 @@ def test_bank_cache_budget_and_context_lifetime_are_bounded(banks):
 
 
 def test_uncached_bank_does_not_fall_back_to_another_banks_cache():
-    reader = make_reader(MagicMock())
+    reader = make_reader(MagicMock(), kv_registry=registry)
     reader._landing_streams = [MagicMock() for _ in range(257)]
     banks = reader._get_dsa_pd_mooncake_staging_banks(257, 1, True)
     host, source = torch.zeros(16, dtype=torch.int8), torch.ones(16, dtype=torch.int8)
@@ -193,7 +195,7 @@ def test_uncached_bank_does_not_fall_back_to_another_banks_cache():
 
 
 def test_layout_change_drains_previous_bank_events_before_replacement():
-    reader = make_reader(MagicMock())
+    reader = make_reader(MagicMock(), kv_registry=registry)
     previous = reader._get_dsa_pd_mooncake_staging_banks(2, 2, True)
     events = [MagicMock(), MagicMock()]
     for bank, event in zip(previous, events):
@@ -208,7 +210,7 @@ def test_layout_change_drains_previous_bank_events_before_replacement():
 
 @pytest.mark.parametrize("overlap", [False, True])
 def test_plan_marks_cross_bank_dependencies_and_keeps_batch_order(overlap):
-    reader = make_reader(MagicMock(), pipeline=True)
+    reader = make_reader(MagicMock(), pipeline=True, kv_registry=registry)
     banks = reader._get_dsa_pd_mooncake_staging_banks(2, 1, True)
     host = torch.empty(64, dtype=torch.int8)
     destinations = [host.data_ptr(), host.data_ptr() + (8 if overlap else 16), host.data_ptr()]
@@ -224,7 +226,7 @@ def test_plan_marks_cross_bank_dependencies_and_keeps_batch_order(overlap):
 
 def test_all_coalesced_target_bounds_are_checked_before_first_staged_read():
     host = torch.empty(32, dtype=torch.int8)
-    reader = make_reader(MagicMock(), pipeline=True)
+    reader = make_reader(MagicMock(), pipeline=True, kv_registry=registry)
     banks = reader._get_dsa_pd_mooncake_staging_banks(2, 1, True)
     with pytest.raises(RuntimeError, match="boundary"):
         reader._prepare_dsa_pd_mooncake_bank_plan(
@@ -238,7 +240,7 @@ def test_all_coalesced_target_bounds_are_checked_before_first_staged_read():
 
 
 def test_failed_event_wait_does_not_skip_other_banks_and_is_retried():
-    reader = make_reader(MagicMock())
+    reader = make_reader(MagicMock(), kv_registry=registry)
     banks = reader._get_dsa_pd_mooncake_staging_banks(2, 2, True)
     events = [MagicMock() for _ in range(2)]
     events[0].synchronize.side_effect = [RuntimeError("wait failed"), None]
@@ -259,7 +261,7 @@ def test_failed_event_wait_does_not_skip_other_banks_and_is_retried():
 
 
 def test_failed_cleanup_retains_owners_until_stream_drain_can_finish():
-    reader = make_reader(MagicMock())
+    reader = make_reader(MagicMock(), kv_registry=registry)
     bank = reader._get_dsa_pd_mooncake_staging_banks(1, 2, True)[0]
     target = torch.empty(16, dtype=torch.int8)
     target_ref = weakref.ref(target)
@@ -277,7 +279,7 @@ def test_failed_cleanup_retains_owners_until_stream_drain_can_finish():
 
 
 def test_failed_event_is_discarded_only_after_successful_stream_drain():
-    reader = make_reader(MagicMock())
+    reader = make_reader(MagicMock(), kv_registry=registry)
     bank = reader._get_dsa_pd_mooncake_staging_banks(1, 2, True)[0]
     event = MagicMock()
     event.synchronize.side_effect = RuntimeError("event failed")
@@ -296,7 +298,7 @@ def test_failed_event_is_discarded_only_after_successful_stream_drain():
 
 
 def test_staging_growth_cannot_drop_an_allocation_that_failed_to_drain(monkeypatch):
-    reader = make_reader(MagicMock())
+    reader = make_reader(MagicMock(), kv_registry=registry)
     previous = reader._dsa_pd_mooncake_staging_tensor
     bank = reader._get_dsa_pd_mooncake_staging_banks(1, 2, True)[0]
     bank.needs_stream_drain = True
@@ -315,8 +317,8 @@ def test_staging_growth_cannot_drop_an_allocation_that_failed_to_drain(monkeypat
 def test_bank_failure_drains_submitted_bytes_before_unlock(monkeypatch, failure):
     source = torch.full((8 * ALIGNMENT,), 19, dtype=torch.uint8)
     host = torch.zeros_like(source)
-    registry.register_dsa_pd_mooncake_offloaded_kv_tensor(host)
-    reader = make_reader(MagicMock(), pipeline=True, window=4)
+    registry.register_offloaded_tensor(host)
+    reader = make_reader(MagicMock(), pipeline=True, window=4, kv_registry=registry)
     runtime = DelayedLanding(monkeypatch, reader)
     reads = 0
 

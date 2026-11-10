@@ -26,12 +26,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullRecvingThread
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
-from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
-from vllm_ascend.worker.v2.attn_utils import (
-    _allocate_dsa_pd_mooncake_kv_tensor,
-    _register_dsa_pd_mooncake_final_kv_views,
-)
 
 
 def pattern(size: int, offset: int = 0) -> torch.Tensor:
@@ -64,11 +61,15 @@ def consumer(args: argparse.Namespace, engine: Any) -> None:
     block = 256
     if args.nbytes % block:
         raise ValueError("nbytes must be a multiple of 256")
-    host = _allocate_dsa_pd_mooncake_kv_tensor(args.nbytes, 2 * 1024 * 1024)
-    _register_dsa_pd_mooncake_final_kv_views({"host": host})
+    # This standalone byte probe owns a CPU fixture, not a serving Host pool.
+    host = torch.empty(args.nbytes, dtype=torch.int8, pin_memory=True)
+    registry = MooncakeKVRegistry()
+    storage = host.untyped_storage()
+    registry.register_cpu_buffer(storage.data_ptr(), storage.nbytes())
+    registry.register_offloaded_tensor(host)
     hbm = torch.zeros(128 * 1024, dtype=torch.int8, device="npu")
     global_te.register_buffer([hbm.data_ptr()], [hbm.nbytes])
-    reader = DSAPDMooncakeStagingReader(engine, {"host": host, "hbm": hbm}, [[block], [block]])
+    reader = DSAPDMooncakeStagingReader(engine, {"host": host, "hbm": hbm}, [[block], [block]], registry=registry)
     thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
     thread.engine, thread.staging_reader = engine, reader
     thread.tp_rank = thread.pcp_rank = thread.dcp_rank = 0

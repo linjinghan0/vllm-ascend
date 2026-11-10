@@ -21,7 +21,6 @@ Verified run recipe (101, linjinghan container, 2026-10-14):
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
 import os
 import threading
@@ -32,31 +31,20 @@ from typing import Any
 import torch
 import torch_npu  # noqa: F401  (must precede mooncake import on Ascend)
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
-    KVCacheRecvingThread,
-)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     global_te,
 )
-from vllm_ascend.kv_offload.dsa_pd_mooncake import (
-    register_dsa_pd_mooncake_offloaded_kv_tensor,
-)
 
-ACL_MEMCPY_DEVICE_TO_DEVICE = 3
 DEFAULT_STAGING_BYTES = 2 * 1024 * 1024
+
+
+registry = MooncakeKVRegistry()
 
 
 def _set_npu_device(device_id: int) -> None:
     torch.npu.set_device(device_id)
-
-
-def _load_acl() -> ctypes.CDLL:
-    for path in ("libascendcl.so", "libacl.so"):
-        try:
-            return ctypes.CDLL(path)
-        except OSError:
-            continue
-    raise RuntimeError("failed to load Ascend ACL runtime library")
 
 
 def _init_engine(hostname: str, protocol: str, device_name: str | None) -> Any:
@@ -110,8 +98,9 @@ def run_server(args: argparse.Namespace) -> None:
 
 
 def _make_fake_recv_thread(transfer_engine: Any, staging_bytes: int) -> Any:
-    thread = object.__new__(KVCacheRecvingThread)
+    thread = object.__new__(DSAPDMooncakeStagingReader)
     thread.engine = transfer_engine
+    thread.kv_registry = registry
     thread.kv_caches = {}
     thread.block_len_per_addr = [[int(staging_bytes)]]
     thread._dsa_pd_mooncake_staging_storage = None
@@ -129,79 +118,25 @@ def _make_fake_recv_thread(transfer_engine: Any, staging_bytes: int) -> Any:
     return thread
 
 
-def _allocate_swapped_target(nbytes: int) -> torch.Tensor:
-    empty_with_swapped_memory = getattr(torch_npu, "empty_with_swapped_memory", None)
-    if empty_with_swapped_memory is None:
-        raise RuntimeError("torch_npu.empty_with_swapped_memory is unavailable")
-    target = empty_with_swapped_memory((nbytes,), dtype=torch.int8, device="npu")
-    register_dsa_pd_mooncake_offloaded_kv_tensor(target)
+def _allocate_host_target(nbytes: int) -> torch.Tensor:
+    """A local byte-check fixture; serving allocations belong to the Manager."""
+    target = torch.empty((nbytes,), dtype=torch.int8, pin_memory=True)
+    storage = target.untyped_storage()
+    registry.register_cpu_buffer(storage.data_ptr(), storage.nbytes())
+    registry.register_offloaded_tensor(target)
     return target
 
 
-def _copy_swapped_sample_to_scratch(
-    target: torch.Tensor,
-    sample_bytes: int,
-) -> tuple[torch.Tensor, str]:
-    sample_bytes = min(int(sample_bytes), int(target.numel()))
-    scratch = torch.empty((sample_bytes,), dtype=torch.int8, device="npu")
-    try:
-        scratch.copy_(target[:sample_bytes], non_blocking=False)
-        torch.npu.synchronize()
-        return scratch, "torch_copy"
-    except BaseException as copy_exc:
-        try:
-            import vllm_ascend.vllm_ascend_C  # noqa: F401
-
-            src_ptrs = torch.tensor([int(target.data_ptr())], dtype=torch.int64)
-            dst_ptrs = torch.tensor([int(scratch.data_ptr())], dtype=torch.int64)
-            sizes = torch.tensor([sample_bytes], dtype=torch.int64)
-            torch.ops._C_ascend.swap_blocks_batch(
-                src_ptrs,
-                dst_ptrs,
-                sizes,
-                ACL_MEMCPY_DEVICE_TO_DEVICE - 1,
-            )
-            torch.npu.synchronize()
-            return scratch, f"swap_blocks_batch_after={copy_exc!r}"
-        except BaseException as swap_exc:
-            acl = _load_acl()
-            acl.aclrtMemcpy.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_int,
-            ]
-            acl.aclrtMemcpy.restype = ctypes.c_int
-            ret = int(
-                acl.aclrtMemcpy(
-                    ctypes.c_void_p(int(scratch.data_ptr())),
-                    ctypes.c_size_t(sample_bytes),
-                    ctypes.c_void_p(int(target.data_ptr())),
-                    ctypes.c_size_t(sample_bytes),
-                    ctypes.c_int(ACL_MEMCPY_DEVICE_TO_DEVICE),
-                )
-            )
-            if ret != 0:
-                raise RuntimeError(
-                    "failed to copy swapped target to scratch: "
-                    f"torch_copy={copy_exc!r}, swap_blocks_batch={swap_exc!r}, aclrtMemcpy={ret}"
-                )
-            torch.npu.synchronize()
-            return scratch, f"aclrtMemcpy_after={copy_exc!r}; swap={swap_exc!r}"
-
-
-def _verify_swapped_target(target: torch.Tensor, fill_value: int, verify_bytes: int) -> tuple[bool, str]:
-    scratch, copy_mode = _copy_swapped_sample_to_scratch(target, verify_bytes)
-    sample = scratch.cpu()
+def _verify_host_target(target: torch.Tensor, fill_value: int, verify_bytes: int) -> tuple[bool, str]:
+    sample = target[: min(verify_bytes, target.numel())]
     expected = torch.full_like(sample, int(fill_value))
-    return bool(torch.equal(sample, expected)), copy_mode
+    return bool(torch.equal(sample, expected)), "cpu_fixture"
 
 
 def run_client(args: argparse.Namespace) -> None:
     _set_npu_device(args.device_id)
     transfer_engine = _init_engine(args.hostname, args.protocol, args.device_name)
-    target = _allocate_swapped_target(args.nbytes)
+    target = _allocate_host_target(args.nbytes)
     thread = _make_fake_recv_thread(transfer_engine, args.staging_bytes)
 
     ret = thread._batch_transfer_sync_read_with_optional_staging(
@@ -214,7 +149,7 @@ def run_client(args: argparse.Namespace) -> None:
     if ret != 0:
         raise RuntimeError(f"staged Mooncake transfer failed: ret={ret}")
 
-    ok, copy_mode = _verify_swapped_target(target, args.fill_value, args.verify_bytes)
+    ok, copy_mode = _verify_host_target(target, args.fill_value, args.verify_bytes)
     print(
         json.dumps(
             {
@@ -231,14 +166,12 @@ def run_client(args: argparse.Namespace) -> None:
         flush=True,
     )
     if not ok:
-        raise RuntimeError("swapped target verification failed")
+        raise RuntimeError("Host fixture verification failed")
     os._exit(0)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Validate Mooncake -> fixed NPU staging chunk -> swapped KV with safe readback."
-    )
+    parser = argparse.ArgumentParser(description="Validate Mooncake -> fixed NPU staging chunk -> CPU byte fixture.")
     parser.add_argument("--role", choices=("server", "client"), required=True)
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--hostname", default="127.0.0.1")

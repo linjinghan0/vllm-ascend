@@ -32,7 +32,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import (
     MooncakeSFAPDState,
     MooncakeSFAStagingReader,
 )
-from vllm_ascend.kv_offload import dsa_pd_mooncake as legacy_registry
 
 from .mooncake_v2.helpers import make_blocks, make_kv_cache_tensor, make_request, make_sfa_indexer_spec
 from .mooncake_v2.test_pull_scheduler import make_pull_scheduler
@@ -92,16 +91,14 @@ def make_manager(*, rank=0, size=2, blocks=4, k_dim=4):
 
 @pytest.fixture(autouse=True)
 def cpu_streams(monkeypatch):
-    legacy_registry.reset_dsa_pd_mooncake_kv_registries()
     monkeypatch.setattr(torch.npu, "stream", lambda _stream: nullcontext())
     monkeypatch.setattr(torch.npu, "Event", MagicMock())
     monkeypatch.setattr(torch.npu, "synchronize", MagicMock())
     yield
-    legacy_registry.reset_dsa_pd_mooncake_kv_registries()
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_projection_uses_manager_views_excludes_scratch_and_keeps_legacy_pool_empty(rank):
+def test_projection_uses_manager_views_excludes_scratch_and_uses_an_isolated_borrowed_registry(rank):
     manager, caches = make_manager(rank=rank)
     if rank:
         # MRV2's non-owner tuple has placeholders; the manager restores its views.
@@ -112,8 +109,8 @@ def test_projection_uses_manager_views_excludes_scratch_and_keeps_legacy_pool_em
     assert host.transfer_caches[INDEXER] is caches[INDEXER]
     assert host.main_group_id == 1
     assert len(caches[MAIN]) == 6
-    assert legacy_registry.get_dsa_pd_shared_host_pool() is None
-    assert not legacy_registry.get_dsa_pd_mooncake_kv_registry()._offloaded_tensors
+    assert not hasattr(host.registry, "allocate")
+    assert MooncakeSFAHostKV(manager, caches).registry is not host.registry
 
 
 @pytest.mark.parametrize("rank", [0, 1])

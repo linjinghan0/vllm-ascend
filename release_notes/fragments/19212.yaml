@@ -1,5 +1,12 @@
 pr: 19212
 entries:
+  - category: breaking
+    text: >-
+      Retired the independent DSA Host KV allocator, TP-shared pool and their
+      V1/V2 CPU-store branches. Nonempty dsa_sparse_attention_config settings
+      now fail with a migration message. Use MooncakeConnectorV2, ModelRunner V2
+      and sparse_kv_offload_config for Manager-owned Host KV with LIM + Copy-SFA.
+      Ordinary HBM Mooncake transfers and the existing SFA connector are preserved.
   - category: config
     text: >-
       MooncakeConnectorV2 with Sparse KV offload now rejects unsupported
@@ -7,11 +14,6 @@ entries:
       default fail policy, including keep_device_kv_cache debugging mode, until
       failed-PD recovery to local prefill is supported. The existing SFA
       connector configuration is unchanged.
-  - category: other
-    text: >-
-      Centralized DSA Host KV allocation and registered final Host views through
-      the V2 runner's pre-connector cache lifecycle, preserving the existing
-      Host allocation sizes and alignment budget.
   - category: performance
     text: >-
       Reused TP-shared Host KV block ownership plans across layers and KV
@@ -23,12 +25,6 @@ entries:
       MooncakeLayerwiseConnector. This unsupported combination now fails before
       allocation; request-level DSA Mooncake transfers and the separate SFA
       layerwise Decode-offload path are preserved.
-  - category: config
-    text: >-
-      Added opt-in TP-shared main Host KV for the eager Model Runner V2
-      MooncakeConnectorV2 DSA consumer through tp_shared_host_kv. One Host
-      allocation is shared across a single-host TP group, with disjoint block
-      receives and ordered single-owner decode writes; the default stays off.
   - category: performance
     text: >-
       Reduced construction overhead for immutable DSA Mooncake staging copy and
@@ -44,10 +40,6 @@ entries:
       Reused one completion event per DSA Mooncake staging bank and processed
       each bank queue in one Host task to reduce event and Future overhead,
       preserving staging reuse waits and final landing synchronization.
-  - category: bugfix
-    text: >-
-      Fixed MooncakeConnectorV2 Host KV allocation for DSA/SFA main caches on Model Runner V2.
-      Unsupported Host KV layouts now fail explicitly instead of silently using device KV.
   - category: performance
     text: Reused the request staging buffer for DSA Host KV landing without repeating capacity checks for each copy.
   - category: performance
@@ -80,6 +72,6 @@ entries:
       thread while preserving staging capacity and ownership until join and drain.
   - category: performance
     text: >-
-      Assigned experimental TP-shared DSA Host KV receives to balanced consecutive
+      Assigned Manager-owned shared Host KV receives to balanced consecutive
       destination-block ranges instead of interleaved modulo ownership, preserving
       source pairing and merging only byte-contiguous transfers.

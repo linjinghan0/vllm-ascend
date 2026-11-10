@@ -2,7 +2,7 @@
 import random
 from unittest import TestCase
 
-from vllm_ascend.kv_offload.dsa_pd_shared_host import DSAPDSharedHostPool, partition_shared_block_groups
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.host_partition import partition_shared_block_groups
 
 
 class TestSharedHostOwnership(TestCase):
@@ -83,23 +83,3 @@ class TestSharedHostOwnership(TestCase):
         ):
             with self.assertRaises(ValueError):
                 partition_shared_block_groups(local, remote, rank, size)
-
-    def test_shared_pointer_lookup_rejects_padding_crossings_and_foreign_buffers(self):
-        pool = object.__new__(DSAPDSharedHostPool)
-        pool._starts = [1024, 4096]
-        pool._ends = [2048, 8192]
-        self.assertTrue(pool.contains(1024, 1024))
-        self.assertTrue(pool.contains(8191, 1))
-        for ptr, length in ((1023, 1), (2048, 1), (2047, 2), (3072, 1), (8191, 2), (1024, 0)):
-            self.assertFalse(pool.contains(ptr, length))
-
-    def test_shared_allocator_may_return_nonmonotonic_nonoverlapping_addresses(self):
-        pool = object.__new__(DSAPDSharedHostPool)
-        pool._starts, pool._ends = [], []
-        pool._register_range(4096, 1024)
-        pool._register_range(1024, 1024)
-        pool._register_range(2048, 1024)
-        self.assertEqual(pool._starts, [1024, 2048, 4096])
-        self.assertTrue(pool.contains(4096, 1024))
-        with self.assertRaisesRegex(RuntimeError, "overlap"):
-            pool._register_range(4000, 200)

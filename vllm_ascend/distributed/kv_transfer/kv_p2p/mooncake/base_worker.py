@@ -57,10 +57,6 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
-from vllm_ascend.kv_offload.dsa_pd_mooncake import (
-    get_dsa_pd_mooncake_kv_register_location,
-    is_dsa_pd_mooncake_offloaded_kv_buffer,
-)
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 
 if TYPE_CHECKING:
@@ -410,14 +406,12 @@ class MooncakeBaseConnectorWorker:
 
         register_regions = collect_configured_register_regions(self.kv_cache_config, kv_caches)
         validate_register_region_count(register_regions)
-        # Swapped Host KV has NPU tensor semantics, but is not an HBM READ
-        # destination. Keep its addresses in the metadata; only register HBM.
+        # Manager-owned Host KV is not an HBM READ destination. Keep its
+        # addresses in metadata, but register only device storage with the transfer engine.
         device_regions = [
             (ptr, length)
             for ptr, length in zip(register_regions.ptrs, register_regions.lengths)
-            if get_dsa_pd_mooncake_kv_register_location(ptr, length) != "cpu"
-            and not is_dsa_pd_mooncake_offloaded_kv_buffer(ptr, length)
-            and (self._sfa_host_kv is None or self._sfa_host_kv.registry.get_register_location(ptr, length) != "cpu")
+            if self._sfa_host_kv is None or self._sfa_host_kv.registry.get_register_location(ptr, length) != "cpu"
         ]
         if self._sfa_host_kv is not None:
             device_regions = list(dict.fromkeys([*device_regions, *self._sfa_host_kv.device_register_regions()]))

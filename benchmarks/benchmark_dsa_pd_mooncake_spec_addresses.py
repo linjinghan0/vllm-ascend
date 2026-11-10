@@ -63,7 +63,14 @@ def load_planner(root, ref=None):
                 for node in tree.body
                 if isinstance(node, ast.FunctionDef) and node.name == "_build_block_transfer_addresses"
             ),
-            function(read("vllm_ascend/kv_offload/dsa_pd_shared_host.py"), "partition_shared_block_groups"),
+            function(
+                read(
+                    "vllm_ascend/kv_offload/dsa_pd_shared_host.py"
+                    if ref
+                    else "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/host_partition.py"
+                ),
+                "partition_shared_block_groups",
+            ),
             function(
                 read("vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/utils.py"), "group_concurrent_contiguous"
             ),
@@ -91,7 +98,9 @@ def make_case(namespace, blocks, requests, fragmented, targets):
     thread._transfer_targets = targets
     host_bases = {base for layer in thread.kv_caches_base_addr[:host_layers] for base in layer}
     pool = SimpleNamespace(rank=3, size=TP_SIZE, contains=lambda address: address in host_bases)
+    # Historical revisions use the global hook; current code receives the view explicitly.
     namespace["get_dsa_pd_shared_host_pool"] = lambda: pool
+    thread._shared_host_pool = pool
     peer = SimpleNamespace(kv_caches_base_addr=remote_bases)
     remote = SimpleNamespace(
         metadata_by_pcp_rank={0: SimpleNamespace(metadata_by_tp_rank={0: peer})},

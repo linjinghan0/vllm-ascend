@@ -10,7 +10,7 @@ from unittest import TestCase
 
 import torch
 
-from vllm_ascend.kv_offload.dsa_pd_mooncake import _DSAPDMooncakeKVRegistry
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 
 
 class _TensorStub:
@@ -32,7 +32,7 @@ class _TensorStub:
 
 class TestDSAPDMooncakeRegistryRanges(TestCase):
     def setUp(self):
-        self.registry = _DSAPDMooncakeKVRegistry()
+        self.registry = MooncakeKVRegistry()
 
     def test_empty_registries(self):
         self.assertIsNone(self.registry.get_register_location(1000, 1))

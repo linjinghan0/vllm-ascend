@@ -14,16 +14,11 @@ import torch
 from vllm.logger import logger
 
 from vllm_ascend import envs as ascend_envs
-from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
-from vllm_ascend.kv_offload.dsa_pd_mooncake import (
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import (
     DSAPDMooncakeTransferTarget,
-    create_dsa_pd_mooncake_transfer_targets,
-    get_dsa_pd_mooncake_kv_register_location,
-    get_dsa_pd_mooncake_offloaded_kv_byte_tensor,
-    get_dsa_pd_mooncake_offloaded_kv_tensor,
-    get_dsa_pd_shared_host_pool,
-    prepare_dsa_pd_mooncake_transfer_targets,
+    MooncakeKVRegistry,
 )
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 
 _DSA_PD_MOONCAKE_LANDING_VIEW_CACHE_SIZE = 256
 
@@ -144,24 +139,25 @@ class DSAPDMooncakeStagingMixin:
     engine: Any
     kv_caches: dict[str, Any]
     block_len_per_addr: list[list[int]]
+    kv_registry: MooncakeKVRegistry
 
     def _resolve_host_tensor(self, ptr: int, size: int):
-        return get_dsa_pd_mooncake_offloaded_kv_tensor(ptr, size)
+        return self.kv_registry.resolve_offloaded_tensor(ptr, size)
 
     def _resolve_host_bytes(self, ptr: int, size: int):
-        return get_dsa_pd_mooncake_offloaded_kv_byte_tensor(ptr, size)
+        return self.kv_registry.resolve_offloaded_byte_tensor(ptr, size)
 
     def _host_register_location(self, ptr: int, size: int):
-        return get_dsa_pd_mooncake_kv_register_location(ptr, size)
+        return self.kv_registry.get_register_location(ptr, size)
 
     def _prepare_host_targets(self, targets, ptrs, lengths):
-        return prepare_dsa_pd_mooncake_transfer_targets(targets, ptrs, lengths)
+        return self.kv_registry.prepare_transfer_targets(targets, ptrs, lengths)
 
     def _create_host_targets(self, layers):
-        return create_dsa_pd_mooncake_transfer_targets(layers)
+        return self.kv_registry.create_transfer_targets(layers)
 
     def get_shared_host_pool(self):
-        return get_dsa_pd_shared_host_pool()
+        return None
 
     def _init_dsa_pd_mooncake_staging(self) -> None:
         self._dsa_pd_mooncake_staging_storage: torch.Tensor | None = None
@@ -879,8 +875,11 @@ class DSAPDMooncakeStagingReader(DSAPDMooncakeStagingMixin):
         engine: Any,
         kv_caches: dict[str, Any],
         block_len_per_addr: list[list[int]],
+        *,
+        registry: MooncakeKVRegistry,
     ) -> None:
         self.engine = engine
+        self.kv_registry = registry
         self.kv_caches = kv_caches
         self.block_len_per_addr = block_len_per_addr
         self._init_dsa_pd_mooncake_staging()

@@ -93,7 +93,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     allocate_kv_offload_topk_profile_buffers,
     init_sparse_kv_offload_manager,
 )
-from vllm_ascend.kv_offload.dsa_pd_mooncake import get_dsa_pd_mooncake_kv_registry
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
 from vllm_ascend.observability.runtime_guard.hooks import (
     runtime_guard_sample_tokens,
@@ -602,7 +601,6 @@ class NPUModelRunner(GPUModelRunner):
 
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
-        get_dsa_pd_mooncake_kv_registry().register_kv_caches(kv_caches)
         manager = self.sparse_kv_offload_manager
         if manager is None:
             return

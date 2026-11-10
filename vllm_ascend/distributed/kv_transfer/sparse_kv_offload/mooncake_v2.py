@@ -12,14 +12,14 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
     copy_sfa_prefill_dest_geometry,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     OFFLOAD_KV_CACHE_TUPLE_LEN,
 )
-from vllm_ascend.kv_offload.dsa_pd_mooncake import _DSAPDMooncakeKVRegistry
-from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
 
 if TYPE_CHECKING:
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import MooncakeConnectorMetadata
@@ -37,8 +37,8 @@ class MooncakeSFAHostKV:
         self.size = views.tp_size
         self.main_group_id = views.main_group_id
         # Reuse transfer identity/range validation without allocating a DSA pool
-        # or publishing the SFA views into the legacy process-global registry.
-        self.registry = _DSAPDMooncakeKVRegistry()
+        # or creating a process-global allocation registry.
+        self.registry = MooncakeKVRegistry()
         self.transfer_caches = dict(kv_caches)
         self.hot_caches = {}
         self.block_size = views.block_size
@@ -169,7 +169,7 @@ class MooncakeSFAStagingReader(DSAPDMooncakeStagingReader):
 
     def __init__(self, engine: Any, host_kv: MooncakeSFAHostKV, block_lens: list[list[int]]) -> None:
         self.host_kv = host_kv
-        super().__init__(engine, host_kv.transfer_caches, block_lens)
+        super().__init__(engine, host_kv.transfer_caches, block_lens, registry=host_kv.registry)
 
     def _resolve_host_tensor(self, ptr, size):
         return self.host_kv.registry.resolve_offloaded_tensor(ptr, size)

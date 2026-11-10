@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm_ascend import envs
-from vllm_ascend.kv_offload import dsa_pd_mooncake_staging as staging
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import staging
 
 from .test_dsa_pd_mooncake_bank_workers import BANKS, HOST_STRIDE, PIECE_BYTES, build
 

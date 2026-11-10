@@ -12,10 +12,12 @@ import pytest
 import torch
 
 from vllm_ascend import envs
-from vllm_ascend.kv_offload import dsa_pd_mooncake as registry
-from vllm_ascend.kv_offload import dsa_pd_mooncake_staging as staging_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import staging as staging_module
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import transfer_targets as registry_module
 
 from .test_dsa_pd_mooncake_connector_v2 import make_reader
+
+registry = registry_module.MooncakeKVRegistry()
 
 ALIGNMENT = 2 * 1024 * 1024
 WINDOW = 16
@@ -26,9 +28,9 @@ HOST_STRIDE = 192
 
 @pytest.fixture(autouse=True)
 def reset_registry():
-    registry.reset_dsa_pd_mooncake_kv_registries()
+    registry.clear()
     yield
-    registry.reset_dsa_pd_mooncake_kv_registries()
+    registry.clear()
 
 
 class BankRuntime:
@@ -200,8 +202,8 @@ def build(monkeypatch, workers=None, count=37, metadata=True, banks=BANKS, windo
     source = storage[offset : offset + count * PIECE_BYTES]
     source.copy_((torch.arange(source.numel()) % 251).to(torch.uint8))
     host = torch.zeros(count * HOST_STRIDE, dtype=torch.uint8)
-    registry.register_dsa_pd_mooncake_offloaded_kv_tensor(host)
-    reader = make_reader(MagicMock(), pipeline=True, window=window, bank_workers=workers)
+    registry.register_offloaded_tensor(host)
+    reader = make_reader(MagicMock(), pipeline=True, window=window, bank_workers=workers, kv_registry=registry)
     reader._pipeline_banks = banks
     active_banks = min(banks, window) if window >= 2 else 1
     expected_workers = active_banks if active_banks > 1 else 0
@@ -214,7 +216,7 @@ def build(monkeypatch, workers=None, count=37, metadata=True, banks=BANKS, windo
         reader._copy_dsa_pd_mooncake_staging_to_offloaded_kv = runtime.copy
     kwargs = {}
     if metadata:
-        table = registry.create_dsa_pd_mooncake_transfer_targets([[host]])
+        table = registry.create_transfer_targets([[host]])
         kwargs["transfer_targets"] = [table[0][0]] * count
     args = (
         "peer",
@@ -510,7 +512,7 @@ def test_direct_only_read_does_not_create_workers_or_touch_staging(monkeypatch):
         return 0
 
     engine.batch_transfer_sync_read.side_effect = read
-    reader = make_reader(engine, pipeline=True, window=WINDOW, bank_workers=None)
+    reader = make_reader(engine, pipeline=True, window=WINDOW, bank_workers=None, kv_registry=registry)
     reader._ensure_dsa_pd_mooncake_staging_tensor = MagicMock(side_effect=AssertionError("unexpected staging"))
     monkeypatch.setattr(torch.npu, "set_device", MagicMock(side_effect=AssertionError("unexpected worker")))
     assert reader.batch_transfer_sync_read("peer", [target.data_ptr()], [source.data_ptr()], [32], "direct") == 0

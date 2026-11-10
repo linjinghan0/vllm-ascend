@@ -8,21 +8,23 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_ascend.kv_offload import dsa_pd_mooncake as registry
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import transfer_targets as registry_module
 
 from .test_dsa_pd_mooncake_connector_v2 import make_reader
+
+registry = registry_module.MooncakeKVRegistry()
 
 ALIGNMENT = 2 * 1024 * 1024
 
 
 @pytest.fixture(autouse=True)
 def reset_registry(monkeypatch):
-    registry.reset_dsa_pd_mooncake_kv_registries()
+    registry.clear()
     monkeypatch.setattr(torch.npu, "stream", lambda _stream: nullcontext())
     monkeypatch.setattr(torch.npu, "Event", MagicMock())
     monkeypatch.setattr(torch.npu, "synchronize", MagicMock())
     yield
-    registry.reset_dsa_pd_mooncake_kv_registries()
+    registry.clear()
 
 
 @pytest.mark.parametrize("chunk_units", [1, 2])
@@ -35,9 +37,9 @@ def test_partial_first_slot_and_aligned_tails_preserve_mixed_landing(chunk_units
     target_offset = 13
     host = torch.zeros(length + 2 * target_offset, dtype=torch.int8)
     direct = torch.zeros(16, dtype=torch.int8)
-    registry.register_dsa_pd_mooncake_offloaded_kv_tensor(host)
+    registry.register_offloaded_tensor(host)
     engine = MagicMock()
-    reader = make_reader(engine, pipeline=pipeline, window=4)
+    reader = make_reader(engine, pipeline=pipeline, window=4, kv_registry=registry)
     reader.block_len_per_addr = [[chunk]]
     reader._dsa_pd_mooncake_staging_tensor = torch.empty(4 * chunk, dtype=torch.int8)
     reader._dsa_pd_mooncake_staging_bytes = 4 * chunk
@@ -65,7 +67,7 @@ def test_partial_first_slot_and_aligned_tails_preserve_mixed_landing(chunk_units
     engine.batch_transfer_sync_read.side_effect = read
     kwargs = {}
     if metadata:
-        table = registry.create_dsa_pd_mooncake_transfer_targets([[host], [direct]])
+        table = registry.create_transfer_targets([[host], [direct]])
         kwargs["transfer_targets"] = [table[0][0], table[1][0]]
     assert (
         reader.batch_transfer_sync_read(

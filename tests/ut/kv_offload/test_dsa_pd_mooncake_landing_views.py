@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import _DSAPDMooncakeLandingViews
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import _DSAPDMooncakeLandingViews
 
 from .test_dsa_pd_mooncake_connector_v2 import make_reader
 

@@ -96,11 +96,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     allocate_kv_cache_tensors_for_sparse_kv_offload,
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
-from vllm_ascend.kv_offload.dsa_pd_mooncake import (
-    get_dsa_pd_mooncake_kv_registry,
-    should_use_dsa_pd_mooncake_cpu_kv,
-    should_use_dsa_pd_mooncake_long_context_kv,
-)
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
 from vllm_ascend.models.qwen4_exp.cache_config import (
@@ -937,23 +932,6 @@ def _align_memory(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     return tensor[int(offset) :]
 
 
-def _use_dsa_pd_mooncake_cpu_kv(vllm_config, *, is_sparse_kv_cache: bool) -> bool:
-    from vllm_ascend.ascend_config import get_ascend_config
-
-    dsa_sparse_attention_config = getattr(get_ascend_config(), "dsa_sparse_attention_config", None)
-    enable_cpu_kv_store = bool(getattr(dsa_sparse_attention_config, "enable_cpu_kv_store", False))
-    dsa_sparse_attention_mode = getattr(dsa_sparse_attention_config, "mode", None)
-    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-    is_kv_consumer = bool(getattr(kv_transfer_config, "is_kv_consumer", False))
-    return should_use_dsa_pd_mooncake_cpu_kv(
-        vllm_config,
-        use_sparse=is_sparse_kv_cache,
-        is_kv_consumer=is_kv_consumer,
-        enable_cpu_kv_store=enable_cpu_kv_store,
-        dsa_sparse_attention_mode=dsa_sparse_attention_mode,
-    )
-
-
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -1557,13 +1535,8 @@ def _allocate_kv_cache(
                 )
         elif enable_sfa(vllm_config) and kv_cache_spec_uses_packed_sfa_main_cache(example_spec):
             k_size = kv_cache_tensor_size
-            use_host_kv = should_use_dsa_pd_mooncake_long_context_kv(vllm_config)
             for layer_name in shared_names:
-                kv_cache_raw_tensors[layer_name] = (
-                    get_dsa_pd_mooncake_kv_registry().allocate(k_size, alignment)
-                    if use_host_kv
-                    else _allocate_int8_cache_tensor(k_size, alignment, device)
-                )
+                kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(k_size, alignment, device)
         elif type(example_spec) is FullAttentionSpec and not enable_sfa(vllm_config):
             for layer_name in shared_names:
                 layer_spec = layer_kv_cache_spec[layer_name]
@@ -1601,16 +1574,8 @@ def _allocate_kv_cache(
                     k_factor, v_factor = calc_split_factor([k_dim, v_dim])
                 k_size = int(layer_size // k_factor)
                 v_size = int(layer_size // v_factor)
-                use_dsa_pd_mooncake_cpu_kv = _use_dsa_pd_mooncake_cpu_kv(
-                    vllm_config,
-                    is_sparse_kv_cache=True,
-                )
-                if use_dsa_pd_mooncake_cpu_kv:
-                    k_tensor = get_dsa_pd_mooncake_kv_registry().allocate(k_size, alignment)
-                    v_tensor = get_dsa_pd_mooncake_kv_registry().allocate(v_size, alignment)
-                else:
-                    k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
-                    v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
+                k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
+                v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
                 kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor)
         else:
             k_dim, v_dim = _get_attention_kv_cache_dims(example_layer_name, example_spec)
@@ -1622,16 +1587,9 @@ def _allocate_kv_cache(
                 k_factor, v_factor = calc_split_factor([k_dim, v_dim])
             k_size = int(kv_cache_tensor_size // k_factor)
             v_size = int(kv_cache_tensor_size // v_factor)
-            # DSA/SFA main caches use this split layout when they are not
-            # quantized. Indexer caches were handled above and stay on NPU.
-            use_host_kv = should_use_dsa_pd_mooncake_long_context_kv(vllm_config)
             for layer_name in shared_names:
-                if use_host_kv:
-                    k_tensor = get_dsa_pd_mooncake_kv_registry().allocate(k_size, alignment)
-                    v_tensor = get_dsa_pd_mooncake_kv_registry().allocate(v_size, alignment)
-                else:
-                    k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
-                    v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
+                k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
+                v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
                 kv_cache_raw_tensors[layer_name] = (k_tensor, v_tensor)
 
     for layer_name, owner_name in layerwise_aliases.items():
@@ -1666,12 +1624,6 @@ def allocate_kv_cache_main(
         if (target_layer := getattr(layer, "kv_sharing_target_layer_name", None))
     }
 
-    from vllm_ascend.ascend_config import get_ascend_config
-
-    dsa_sparse_config = getattr(get_ascend_config(), "dsa_sparse_attention_config", None)
-    dsa_registry = get_dsa_pd_mooncake_kv_registry()
-    dsa_registry.initialize(vllm_config, kv_cache_config, dsa_sparse_config, num_layers=len(attn_layers))
-
     raw_tensors = _allocate_kv_cache(
         kv_cache_config,
         shared_layers=shared_layers,
@@ -1703,7 +1655,7 @@ def allocate_kv_cache_main(
                 group_map[key].layer_names.append(layer_name)
         attn_groups.extend(group_map[key] for key in group_order)
 
-    kv_caches = _reshape_kv_cache_v2(
+    return _reshape_kv_cache_v2(
         attn_groups=attn_groups,
         kv_cache_raw_tensors=raw_tensors,
         cache_dtype=vllm_config.cache_config.cache_dtype,
@@ -1711,18 +1663,6 @@ def allocate_kv_cache_main(
         shared_kv_cache_layers=shared_layers,
         kv_cache_config=kv_cache_config,
     )
-    if (
-        should_use_dsa_pd_mooncake_long_context_kv(vllm_config)
-        and kv_caches
-        and not dsa_registry.has_pending_allocations
-    ):
-        raise RuntimeError(
-            "DSA Mooncake Host KV was requested, but no Host main KV was allocated. "
-            "The current cache layout does not support the Host staging path."
-        )
-    # The runner registers final Host views through the same pre-connector
-    # hook as SFA after upstream has bound every attention cache.
-    return kv_caches
 
 
 def _reshape_mamba_kv_cache(

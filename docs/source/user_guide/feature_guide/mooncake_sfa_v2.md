@@ -21,9 +21,12 @@ addition to the deployment's model, tensor parallel and serving options:
 
 Choose the Host capacity and hot-row budget for the deployment. The hot-row
 budget must satisfy the existing LIM + Copy-SFA configuration requirements.
-Do not also enable `dsa_sparse_attention_config.enable_cpu_kv_store` or
-`dsa_sparse_attention_config.tp_shared_host_kv`: the SFA manager owns the Host
-allocation and shared views in this mode.
+The independent DSA Host allocator and TP-shared pool have been removed.
+Remove the retired `dsa_sparse_attention_config` section; nonempty values
+fail at startup with a migration message, including configurations that do
+not enable Manager offload. The Manager configuration above is the only
+serving Host KV owner for this path. Ordinary device-resident Mooncake and
+the existing SFA connector keep their configuration.
 
 The V2 connector publishes persistent Host main KV and HBM indexer/scale
 components. SFA device placeholders are not PD payload. Main blocks are
@@ -82,9 +85,8 @@ LIM, Copy-SFA, hot-cache management and current-token Host writeback.
 This combination retains existing SFA offload restrictions, including BF16 main
 KV, supported device-resident indexer formats, and no context/pipeline parallel
 offload. It selects LIM + Copy-SFA; `use_fused_overlap=true` is rejected for this
-V2 combination. SFA offload uses native preprocessing, so performance comparisons
-with the legacy DSA Host path must account for the backend change, hot-buffer
-memory and the direct HBM hot/tail PD reads.
+V2 combination. SFA offload uses native preprocessing; this path retains
+the existing hot-buffer memory and direct HBM hot/tail PD reads.
 
 Configure this combination directly as `MooncakeConnectorV2`. Wrapping it in
 `MultiConnector` is rejected until sparse slot and first-decode hooks are

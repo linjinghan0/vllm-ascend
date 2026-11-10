@@ -109,18 +109,34 @@ With vLLM 0.32.0, enable ModelRunner V2 with
 {"kv_connector": "MooncakeConnectorV2", "kv_role": "kv_consumer"}
 ```
 
-Set `kv_role` to `kv_producer` on P. On D, keep the DSA
-`dsa_sparse_attention_config` settings `mode: fused_overlap` and
-`enable_cpu_kv_store: true` in `additional_config`, together with the model's
-sparse-attention settings. This path uses the DSA swapped Host KV allocator.
+Set `kv_role` to `kv_producer` on P. On D, enable the existing Manager
+path in `additional_config`:
 
-P's source KV and D's HBM destinations are registered with Mooncake. D's Host
-KV addresses remain in the transfer metadata but are excluded from HBM
-registration. Host-bound READs first enter a pre-registered HBM staging
-window, then land through the DSA tensor views. HBM-bound READs remain direct.
-The existing V2 layer, block, TP and PCP mapping is preserved; completion is
-reported only after all landing copies finish. Concurrent peer buckets share
-one staging lock through READ and landing.
+```json
+{
+  "sparse_kv_offload_config": {
+    "enabled": true,
+    "topk_buffer_size": 2048,
+    "dram_size_per_dp_GB": 128,
+    "use_fused_overlap": false
+  }
+}
+```
+
+`SparseKVOffloadManager` owns Host KV, hot rows and current-token writeback.
+Mooncake borrows its cache views and transfers Host-bound bytes through the
+existing bounded HBM staging window. Indexer, dense-prefix and circular-tail
+HBM destinations retain their direct READ plans. Completion requires the
+existing landing/event drain before decode can use the received KV.
+
+The retired `dsa_sparse_attention_config` is rejected when nonempty. Remove
+its CPU-store and TP-shared-pool settings and use the Manager configuration
+above. The experimental independent Host pool and its V1/V2 allocation
+branches have been removed. Ordinary device-resident Mooncake transfers and
+the separate SFA connector retain their existing configuration.
+
+See [Mooncake V2 with SFA offload](../../user_guide/feature_guide/mooncake_sfa_v2.md)
+for supported layouts and failure-policy requirements.
 
 `VLLM_ASCEND_DSA_PD_MOONCAKE_STAGING_WINDOW` keeps its total slot count
 (default 16), with each slot rounded to at least 2 MiB. Source page offsets
@@ -207,54 +223,6 @@ This transport path requires Ascend hardware validation, including TP-shared
 host writes, multi-chunk transfers, short/long Copy-SFA requests, and read or
 local-copy failure handling. CPU descriptor tests do not establish hardware
 or model correctness.
-
-### Experimental TP-shared Host KV for DSA
-
-The eager Model Runner V2 `MooncakeConnectorV2` consumer can opt into one
-TP-shared main Host KV allocation instead of a separate full copy per rank:
-
-```json
-{
-  "dsa_sparse_attention_config": {
-    "mode": "fused_overlap",
-    "enable_cpu_kv_store": true,
-    "tp_shared_host_kv": true,
-    "shared_host_store_port": 8650
-  }
-}
-```
-
-`tp_shared_host_kv` defaults to `false`. The shared-store port is an integer
-in `[1, 65535]` and defaults to `8650`. Enable this setting only on D. The first
-implementation requires eager execution, one host for the entire TP group,
-and `DP=PP=PCP=DCP=1`; unsupported parallel configurations fail during startup.
-It also requires the installed TorchNPU borrowed-storage constructor and
-`memfabric_hybrid.offload` shared allocation/copy APIs. Initial validation
-targets the BF16 split main-KV layout; quantized main-KV layouts require
-separate validation.
-
-TP0 owns the shared CPU allocation. Other TP ranks retain non-owning NPU views
-of the imported global virtual addresses. Main Host blocks are sorted by physical
-destination block ID, keeping each source/destination pair intact, then divided
-into balanced consecutive ranges across the actual TP group. Each destination
-has one receiving rank. Adjacent blocks merge only when source and destination
-byte ranges are both contiguous; strided or partial-block copies retain separate
-descriptors. Indexer/HBM destinations retain their rank-local transfer plans. Staging-to-Host landing
-uses the shared-memory copy API, with descriptors protected by the existing
-bank events. A successful receive still requires the final landing drain.
-
-During decode, TP0 writes newly computed main KV. Other ranks keep their
-query and indexer computation but mask main-KV write slots. A device TP
-collective after each layer's main-cache write orders visibility before any
-rank reads the shared cache. This synchronization is part of the measured
-decode cost. Selection/indexer state and other device caches stay rank-local;
-the setting retains the existing DSA attention implementation.
-
-The worker's KV registry owns the pool and borrowed views for the worker's
-lifetime. Reinitializing shared backing in a live worker is rejected. Memory
-validation must read shared Host data through its CPU owner; a non-root
-imported GVA is not an ordinary CPU mapping and must not be dereferenced with
-a CPU tensor or raw ACL Host copy.
 
 ### 3. Interface Design
 

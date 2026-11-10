@@ -25,7 +25,9 @@ from unittest.mock import patch
 import torch
 from benchmark_dsa_pd_mooncake_registry import _measure_pair
 
-from vllm_ascend.kv_offload import dsa_pd_mooncake as registry
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
+
+registry = MooncakeKVRegistry()
 
 ALIGNMENT = 2 * 1024 * 1024
 LAYERS = 78
@@ -51,6 +53,7 @@ class _Engine:
 def _make_reader(reader_type):
     reader = reader_type.__new__(reader_type)
     reader.engine = _Engine()
+    reader.kv_registry = registry
     reader.kv_caches = {f"direct.{i}": torch.empty(1024 * 1024, dtype=torch.int8) for i in range(DIRECT_TENSORS)}
     for layer in range(LAYERS):
         pair = (
@@ -59,7 +62,7 @@ def _make_reader(reader_type):
         )
         reader.kv_caches[f"host.{layer}"] = pair
         for tensor in pair:
-            registry.register_dsa_pd_mooncake_offloaded_kv_tensor(tensor)
+            registry.register_offloaded_tensor(tensor)
     reader.block_len_per_addr = [[MAIN_BLOCK_BYTES, ROPE_BLOCK_BYTES]]
     reader._dsa_pd_mooncake_staging_lock = threading.Lock()
     reader._dsa_pd_mooncake_staging_tensor = torch.empty(16 * ALIGNMENT, dtype=torch.int8)
@@ -74,7 +77,7 @@ def _make_reader(reader_type):
 
 
 def _counts(reader, operation):
-    book = registry._DSA_PD_MOONCAKE_KV_REGISTRY
+    book = registry
     with (
         patch.object(book, "resolve_offloaded_tensor", wraps=book.resolve_offloaded_tensor) as tensors,
         patch.object(book, "get_register_location", wraps=book.get_register_location) as locations,
@@ -113,10 +116,10 @@ def main():
     engine_module.global_te = SimpleNamespace(register_buffer=lambda *_args: None)
     with patch.object(torch, "npu", fake_npu, create=True), patch.dict(sys.modules, {engine_name: engine_module}):
         # The staging module's evaluated NPU annotations need this CPU stub.
-        staging = importlib.import_module("vllm_ascend.kv_offload.dsa_pd_mooncake_staging")
+        staging = importlib.import_module("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging")
         # Keep log I/O out of both CPU preparation measurements.
         staging.logger.info = lambda *_args, **_kwargs: None
-        registry.reset_dsa_pd_mooncake_kv_registries()
+        registry.clear()
         reader = _make_reader(staging.DSAPDMooncakeStagingReader)
         layers = [list(reader._iter_kv_cache_tensors(value)) for value in reader.kv_caches.values()]
         bases = [[tensor.data_ptr() for tensor in layer] for layer in layers]

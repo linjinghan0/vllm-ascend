@@ -33,6 +33,7 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.host_partition import partition_shared_block_groups
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakePPTransferMetadata,
@@ -40,21 +41,15 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadataGroups,
     ReqMeta,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import DSAPDMooncakeTransferTarget
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     SizedDict,
-    as_kv_cache_tensors,
     ensure_zmq_recv,
     ensure_zmq_send,
     group_concurrent_contiguous,
     zmq_ctx,
 )
-from vllm_ascend.kv_offload.dsa_pd_mooncake import (
-    DSAPDMooncakeTransferTarget,
-    get_dsa_pd_shared_host_pool,
-    is_dsa_pd_mooncake_offloaded_kv_buffer,
-)
-from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
-from vllm_ascend.kv_offload.dsa_pd_shared_host import partition_shared_block_groups
 
 _BULK_TRANSFER_ADDRESS_GROUPS = 32
 
@@ -1184,7 +1179,7 @@ class MooncakePullRecvingThread(threading.Thread):
         """Append addresses, optionally reusing this request's TP ownership plan."""
         if transfer_len <= 0:
             return
-        shared_pool = shared_host_pool or get_dsa_pd_shared_host_pool()
+        shared_pool = shared_host_pool
         if shared_pool is not None and shared_pool.contains(local_base_addr):
             coalesce = local_block_stride == remote_block_stride == transfer_len
             key = (shared_pool.rank, shared_pool.size, coalesce)
@@ -1773,14 +1768,6 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
 
                 staging_reader = MooncakeSFAStagingReader(self.engine, host_kv, self.xfer_handshake_metadata.block_lens)
                 self._sfa_pd_state = MooncakeSFAPDState(host_kv.main_group_id)
-            elif any(
-                is_dsa_pd_mooncake_offloaded_kv_buffer(int(cache.data_ptr()), int(cache.nbytes))
-                for cache_or_caches in kv_caches.values()
-                for cache in as_kv_cache_tensors(cache_or_caches)
-            ):
-                staging_reader = DSAPDMooncakeStagingReader(
-                    self.engine, kv_caches, self.xfer_handshake_metadata.block_lens
-                )
             ready_event = threading.Event()
             self._recving_thread = MooncakePullRecvingThread(
                 engine=self.engine,

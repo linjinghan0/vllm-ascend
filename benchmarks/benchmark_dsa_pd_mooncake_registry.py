@@ -25,7 +25,7 @@ import types
 from functools import partial
 from pathlib import Path
 
-from vllm_ascend.kv_offload.dsa_pd_mooncake import _DSAPDMooncakeKVRegistry
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 
 SOURCE_PATH = "vllm_ascend/kv_offload/dsa_pd_mooncake.py"
 BASE_ADDRESS = 1 << 40
@@ -122,7 +122,7 @@ def main():
     )
     baseline_module = types.ModuleType("_dsa_registry_benchmark_baseline")
     exec(compile(baseline_source, f"{args.baseline_ref}:{SOURCE_PATH}", "exec"), baseline_module.__dict__)
-    classes = {"baseline": baseline_module._DSAPDMooncakeKVRegistry, "optimized": _DSAPDMooncakeKVRegistry}
+    classes = {"baseline": baseline_module._DSAPDMooncakeKVRegistry, "optimized": MooncakeKVRegistry}
     result = {
         "environment": {
             "hostname": platform.node(),
@@ -130,7 +130,9 @@ def main():
             "python": sys.version,
             "baseline_ref": args.baseline_ref,
             "baseline_sha256": hashlib.sha256(baseline_source.encode()).hexdigest(),
-            "optimized_sha256": hashlib.sha256((root / SOURCE_PATH).read_bytes()).hexdigest(),
+            "optimized_sha256": hashlib.sha256(
+                (root / "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/transfer_targets.py").read_bytes()
+            ).hexdigest(),
             "cpu_affinity": sorted(os.sched_getaffinity(0)),
             "gc_enabled": gc.isenabled(),
             "profiler_enabled": False,

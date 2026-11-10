@@ -15,9 +15,10 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import regex as re
 import torch
 
-from vllm_ascend.kv_offload.dsa_pd_mooncake_staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
 
 ALIGNMENT = 2 * 1024 * 1024
 LAYERS = 78
@@ -32,6 +33,14 @@ def main():
     root = Path(__file__).resolve().parents[1]
     source = subprocess.check_output(
         ["git", "show", args.baseline_ref + ":vllm_ascend/kv_offload/dsa_pd_mooncake_staging.py"], cwd=root, text=True
+    )
+    # Load the historical copy implementation without its retired global
+    # registry imports. This benchmark supplies every target view explicitly.
+    source = re.sub(
+        r"from vllm_ascend\.kv_offload\.dsa_pd_mooncake import \([\s\S]*?\)\n",
+        "from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets "
+        "import DSAPDMooncakeTransferTarget\n",
+        source,
     )
     baseline_path = args.output.with_suffix(".baseline.py")
     baseline_path.write_text(source)

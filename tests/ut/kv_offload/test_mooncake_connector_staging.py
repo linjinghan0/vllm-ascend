@@ -1,4 +1,4 @@
-"""Unit tests for the staged (HBM-relay) receive path in mooncake_connector.
+"""Unit tests for the shared Mooncake staged (HBM-relay) receive path.
 
 Ported from the glm52 branch increment to tests/ut/kv_offload/
 test_mooncake_connector.py (commit chain 1e9ebb64..8956d8f3). The upstream
@@ -16,21 +16,17 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
-    KVCacheRecvingThread,
-)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     GlobalTE,
 )
-from vllm_ascend.kv_offload.dsa_pd_mooncake import (
-    clear_dsa_pd_mooncake_kv_buffer_registries_for_testing,
-    register_dsa_pd_mooncake_offloaded_kv_tensor,
-)
 
 
-def _make_fake_recv_thread(staging_chunk_bytes: int) -> KVCacheRecvingThread:
-    thread = object.__new__(KVCacheRecvingThread)
+def _make_fake_recv_thread(staging_chunk_bytes: int) -> DSAPDMooncakeStagingReader:
+    thread = object.__new__(DSAPDMooncakeStagingReader)
     thread.engine = MagicMock()
+    thread.kv_registry = MooncakeKVRegistry()
     thread.kv_caches = {}
     thread.block_len_per_addr = [[int(staging_chunk_bytes)]]
     thread._dsa_pd_mooncake_staging_storage = None
@@ -44,16 +40,15 @@ def _make_fake_recv_thread(staging_chunk_bytes: int) -> KVCacheRecvingThread:
     return thread
 
 
-class TestKVCacheRecvingThreadStaging(unittest.TestCase):
+class TestDSAPDMooncakeStagingReaderStaging(unittest.TestCase):
     def setUp(self):
-        clear_dsa_pd_mooncake_kv_buffer_registries_for_testing()
         self.staging_chunk_bytes = 2 * 1024 * 1024
         self.thread = _make_fake_recv_thread(self.staging_chunk_bytes)
 
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.global_te.register_buffer")
     def test_offloaded_kv_transfer_uses_reused_fixed_staging_chunk(self, mock_register_buffer):
         offloaded_kv = torch.empty((3 * self.staging_chunk_bytes,), dtype=torch.int8)
-        register_dsa_pd_mooncake_offloaded_kv_tensor(offloaded_kv)
+        self.thread.kv_registry.register_offloaded_tensor(offloaded_kv)
         staging = torch.empty((self.staging_chunk_bytes,), dtype=torch.int8)
         copied: list[tuple[int, int, int]] = []
 
@@ -98,11 +93,11 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         )
         mock_register_buffer.assert_not_called()
 
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.synchronize")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.global_te.register_buffer")
     def test_offloaded_staging_read_synchronizes_once_per_batch(self, mock_register_buffer, mock_sync):
         offloaded_kv = torch.empty((3 * self.staging_chunk_bytes,), dtype=torch.int8)
-        register_dsa_pd_mooncake_offloaded_kv_tensor(offloaded_kv)
+        self.thread.kv_registry.register_offloaded_tensor(offloaded_kv)
         staging = torch.empty((4 * self.staging_chunk_bytes,), dtype=torch.int8)
 
         self.thread._dsa_pd_mooncake_staging_tensor = staging
@@ -126,7 +121,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
 
     def test_offloaded_staging_read_holds_shared_lock(self):
         offloaded_kv = torch.empty((4096,), dtype=torch.int8)
-        register_dsa_pd_mooncake_offloaded_kv_tensor(offloaded_kv)
+        self.thread.kv_registry.register_offloaded_tensor(offloaded_kv)
 
         def assert_lock_held(*args, **kwargs):
             self.assertTrue(self.thread._dsa_pd_mooncake_staging_lock.locked())
@@ -148,10 +143,10 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         with patch.dict(os.environ, {"VLLM_ASCEND_DSA_PD_MOONCAKE_STAGING_WINDOW": "3"}):
             self.assertEqual(self.thread._get_dsa_pd_mooncake_staging_window(), 3)
 
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.Event")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.stream")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.Event")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.stream")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.synchronize")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.global_te.register_buffer")
     def test_pipeline_four_banks_round_robin(self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls):
         # Isolate caller-thread bank rotation; automatic workers have separate
         # concurrent byte-coverage and ownership tests.
@@ -161,7 +156,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         # back to a bank (read 5 -> bank 0) reclaims its slot just-in-time;
         # each bank's event is recorded on that bank's own stream.
         offloaded_kv = torch.empty((6 * self.staging_chunk_bytes,), dtype=torch.int8)
-        register_dsa_pd_mooncake_offloaded_kv_tensor(offloaded_kv)
+        self.thread.kv_registry.register_offloaded_tensor(offloaded_kv)
         staging = torch.empty((4 * self.staging_chunk_bytes,), dtype=torch.int8)
 
         self.thread._dsa_pd_mooncake_staging_tensor = staging
@@ -240,7 +235,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         mock_register_buffer.assert_not_called()
 
     def test_coalesce_merges_only_fully_contiguous_neighbours(self):
-        merge = KVCacheRecvingThread._coalesce_dsa_pd_mooncake_copy_plan
+        merge = DSAPDMooncakeStagingReader._coalesce_dsa_pd_mooncake_copy_plan
         chunk = self.staging_chunk_bytes
         # Fully contiguous run (pool and staging): three entries -> one copy.
         self.assertEqual(
@@ -261,17 +256,17 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         self.assertEqual(merge([]), [])
         self.assertEqual(merge([(1000, chunk, 0)]), [(1000, chunk, 0)])
 
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.Event")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.stream")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.Event")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.stream")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.synchronize")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.global_te.register_buffer")
     def test_read_probe_disabled_keeps_no_extra_sync(
         self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls
     ):
         # With the probe off (default) the fast path stays probe-free: the
         # only sync sites are the landing modes themselves.
         offloaded_kv = torch.empty((2 * self.staging_chunk_bytes,), dtype=torch.int8)
-        register_dsa_pd_mooncake_offloaded_kv_tensor(offloaded_kv)
+        self.thread.kv_registry.register_offloaded_tensor(offloaded_kv)
         staging = torch.empty((2 * self.staging_chunk_bytes,), dtype=torch.int8)
 
         self.thread._dsa_pd_mooncake_staging_tensor = staging
@@ -292,10 +287,10 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         self.assertEqual(ret, 0)
         mock_sync.assert_not_called()
 
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.Event")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.stream")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.Event")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.stream")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.synchronize")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.global_te.register_buffer")
     def test_pipeline_single_bank_degenerates_to_per_window_waits(
         self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls
     ):
@@ -304,7 +299,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         # next window's read reuses the same slots, plus a final drain — the
         # retired ASYNC_LANDING mode's behavior, now expressed as K=1.
         offloaded_kv = torch.empty((3 * self.staging_chunk_bytes,), dtype=torch.int8)
-        register_dsa_pd_mooncake_offloaded_kv_tensor(offloaded_kv)
+        self.thread.kv_registry.register_offloaded_tensor(offloaded_kv)
         staging = torch.empty((2 * self.staging_chunk_bytes,), dtype=torch.int8)
         copied: list[tuple[int, int, int]] = []
 
@@ -350,15 +345,15 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
             ],
         )
 
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.Event")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.stream")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.Event")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.stream")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.synchronize")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.global_te.register_buffer")
     def test_async_landing_disabled_keeps_global_sync(
         self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls
     ):
         offloaded_kv = torch.empty((3 * self.staging_chunk_bytes,), dtype=torch.int8)
-        register_dsa_pd_mooncake_offloaded_kv_tensor(offloaded_kv)
+        self.thread.kv_registry.register_offloaded_tensor(offloaded_kv)
         staging = torch.empty((4 * self.staging_chunk_bytes,), dtype=torch.int8)
 
         self.thread._dsa_pd_mooncake_staging_tensor = staging
@@ -383,10 +378,10 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         mock_event_cls.assert_not_called()
         mock_register_buffer.assert_not_called()
 
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.Event")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.stream")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.torch.npu.synchronize")
-    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.global_te.register_buffer")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.Event")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.stream")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.synchronize")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.global_te.register_buffer")
     def test_pipeline_landing_overlaps_windows(self, mock_register_buffer, mock_sync, mock_stream, mock_event_cls):
         self.thread._get_dsa_pd_mooncake_bank_workers = lambda _banks: 0
         # WINDOW=4 means 4 total staging slots; pipeline splits them into two
@@ -396,7 +391,7 @@ class TestKVCacheRecvingThreadStaging(unittest.TestCase):
         # The final drain waits out every remaining event before success is
         # reported.
         offloaded_kv = torch.empty((6 * self.staging_chunk_bytes,), dtype=torch.int8)
-        register_dsa_pd_mooncake_offloaded_kv_tensor(offloaded_kv)
+        self.thread.kv_registry.register_offloaded_tensor(offloaded_kv)
         staging = torch.empty((4 * self.staging_chunk_bytes,), dtype=torch.int8)
 
         self.thread._dsa_pd_mooncake_staging_tensor = staging
