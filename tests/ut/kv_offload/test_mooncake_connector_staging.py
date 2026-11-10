@@ -16,16 +16,17 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     GlobalTE,
 )
 
 
-def _make_fake_recv_thread(staging_chunk_bytes: int) -> DSAPDMooncakeStagingReader:
-    thread = object.__new__(DSAPDMooncakeStagingReader)
+def _make_fake_recv_thread(staging_chunk_bytes: int) -> MooncakeSFAStagingReader:
+    thread = object.__new__(MooncakeSFAStagingReader)
     thread.engine = MagicMock()
+    thread.host_kv = None
     thread.kv_registry = MooncakeKVRegistry()
     thread.kv_caches = {}
     thread.block_len_per_addr = [[int(staging_chunk_bytes)]]
@@ -40,7 +41,7 @@ def _make_fake_recv_thread(staging_chunk_bytes: int) -> DSAPDMooncakeStagingRead
     return thread
 
 
-class TestDSAPDMooncakeStagingReaderStaging(unittest.TestCase):
+class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
     def setUp(self):
         self.staging_chunk_bytes = 2 * 1024 * 1024
         self.thread = _make_fake_recv_thread(self.staging_chunk_bytes)
@@ -235,7 +236,7 @@ class TestDSAPDMooncakeStagingReaderStaging(unittest.TestCase):
         mock_register_buffer.assert_not_called()
 
     def test_coalesce_merges_only_fully_contiguous_neighbours(self):
-        merge = DSAPDMooncakeStagingReader._coalesce_dsa_pd_mooncake_copy_plan
+        merge = MooncakeSFAStagingReader._coalesce_dsa_pd_mooncake_copy_plan
         chunk = self.staging_chunk_bytes
         # Fully contiguous run (pool and staging): three entries -> one copy.
         self.assertEqual(

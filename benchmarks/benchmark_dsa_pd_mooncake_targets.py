@@ -53,6 +53,7 @@ class _Engine:
 def _make_reader(reader_type):
     reader = reader_type.__new__(reader_type)
     reader.engine = _Engine()
+    reader.host_kv = None
     reader.kv_registry = registry
     reader.kv_caches = {f"direct.{i}": torch.empty(1024 * 1024, dtype=torch.int8) for i in range(DIRECT_TENSORS)}
     for layer in range(LAYERS):
@@ -120,7 +121,7 @@ def main():
         # Keep log I/O out of both CPU preparation measurements.
         staging.logger.info = lambda *_args, **_kwargs: None
         registry.clear()
-        reader = _make_reader(staging.DSAPDMooncakeStagingReader)
+        reader = _make_reader(staging.MooncakeSFAStagingReader)
         layers = [list(reader._iter_kv_cache_tensors(value)) for value in reader.kv_caches.values()]
         bases = [[tensor.data_ptr() for tensor in layer] for layer in layers]
         tensors = [tensor for layer in layers for tensor in layer]

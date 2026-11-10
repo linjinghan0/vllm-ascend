@@ -18,7 +18,7 @@ from unittest.mock import patch
 import regex as re
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
 
 ALIGNMENT = 2 * 1024 * 1024
 LAYERS = 78
@@ -62,7 +62,7 @@ def main():
     ]
     readers = {
         "baseline": baseline.DSAPDMooncakeStagingReader.__new__(baseline.DSAPDMooncakeStagingReader),
-        "candidate": DSAPDMooncakeStagingReader.__new__(DSAPDMooncakeStagingReader),
+        "candidate": MooncakeSFAStagingReader.__new__(MooncakeSFAStagingReader),
     }
 
     def request(reader, destination_offset):

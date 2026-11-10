@@ -41,7 +41,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadataGroups,
     ReqMeta,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import DSAPDMooncakeTransferTarget
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     SizedDict,
@@ -102,7 +102,7 @@ class MooncakePullRecvingThread(threading.Thread):
         dcp_size: int,
         device: Any,
         ready_event: threading.Event,
-        staging_reader: DSAPDMooncakeStagingReader | None = None,
+        staging_reader: MooncakeSFAStagingReader | None = None,
     ) -> None:
         super().__init__(daemon=True, name="MooncakePullRecvingThread")
         self.engine = engine
@@ -131,7 +131,7 @@ class MooncakePullRecvingThread(threading.Thread):
             else None
         )
         self._shared_host_pool = (
-            staging_reader.get_shared_host_pool() if isinstance(staging_reader, DSAPDMooncakeStagingReader) else None
+            staging_reader.get_shared_host_pool() if isinstance(staging_reader, MooncakeSFAStagingReader) else None
         )
 
         self.use_mla = self.model_config.is_deepseek_mla
@@ -1761,10 +1761,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             staging_reader = None
             host_kv = getattr(self, "_sfa_host_kv", None)
             if host_kv is not None:
-                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import (
-                    MooncakeSFAPDState,
-                    MooncakeSFAStagingReader,
-                )
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import MooncakeSFAPDState
 
                 staging_reader = MooncakeSFAStagingReader(self.engine, host_kv, self.xfer_handshake_metadata.block_lens)
                 self._sfa_pd_state = MooncakeSFAPDState(host_kv.main_group_id)

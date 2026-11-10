@@ -7,13 +7,14 @@ import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import transfer_targets as registry_module
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
 
 from .mooncake_v2.helpers import make_pp_metadata
 from .mooncake_v2.test_pull_worker import make_thread
@@ -34,8 +35,9 @@ def clear_registry(monkeypatch):
 
 
 def make_reader(engine, *, pipeline=False, window=2, bank_workers=0, kv_registry=None):
-    reader = DSAPDMooncakeStagingReader.__new__(DSAPDMooncakeStagingReader)
+    reader = MooncakeSFAStagingReader.__new__(MooncakeSFAStagingReader)
     reader.engine = engine
+    reader.host_kv = None
     reader.kv_registry = kv_registry if kv_registry is not None else registry_module.MooncakeKVRegistry()
     reader.kv_caches = {}
     reader.block_len_per_addr = [[128]]
@@ -55,13 +57,15 @@ def make_reader(engine, *, pipeline=False, window=2, bank_workers=0, kv_registry
 
 
 def test_readers_receive_independent_registry_instances(monkeypatch):
-    monkeypatch.setattr(DSAPDMooncakeStagingReader, "_init_dsa_pd_mooncake_staging", lambda self: None)
+    monkeypatch.setattr(MooncakeSFAStagingReader, "_init_dsa_pd_mooncake_staging", lambda self: None)
     left_registry = registry_module.MooncakeKVRegistry()
     right_registry = registry_module.MooncakeKVRegistry()
     target = torch.zeros(64, dtype=torch.int8)
     left_registry.register_offloaded_tensor(target)
-    left = DSAPDMooncakeStagingReader(MagicMock(), {}, [[128]], registry=left_registry)
-    right = DSAPDMooncakeStagingReader(MagicMock(), {}, [[128]], registry=right_registry)
+    left_host = SimpleNamespace(transfer_caches={}, registry=left_registry)
+    right_host = SimpleNamespace(transfer_caches={}, registry=right_registry)
+    left = MooncakeSFAStagingReader(MagicMock(), left_host, [[128]])
+    right = MooncakeSFAStagingReader(MagicMock(), right_host, [[128]])
     assert left._resolve_host_tensor(target.data_ptr(), target.nbytes)[0] is target
     assert right._resolve_host_tensor(target.data_ptr(), target.nbytes) is None
     right_registry.clear()

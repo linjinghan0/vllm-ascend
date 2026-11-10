@@ -151,7 +151,7 @@ def test_failed_stream_drain_still_drains_peers_and_retains_tensor_owners():
     bank = staging._DSAPDMooncakeStagingBank(
         0, 4, first, None, copy_streams=(first, second), needs_stream_drain=True, inflight_owners=[(owner,)]
     )
-    reader = staging.DSAPDMooncakeStagingReader.__new__(staging.DSAPDMooncakeStagingReader)
+    reader = staging.MooncakeSFAStagingReader.__new__(staging.MooncakeSFAStagingReader)
     with pytest.raises(RuntimeError, match="stream drain failed"):
         reader._drain_dsa_pd_mooncake_staging_banks((bank,))
     second.synchronize.assert_called_once()

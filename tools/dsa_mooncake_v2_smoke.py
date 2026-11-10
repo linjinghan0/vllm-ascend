@@ -26,7 +26,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadata,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullRecvingThread
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 
@@ -69,7 +69,14 @@ def consumer(args: argparse.Namespace, engine: Any) -> None:
     registry.register_offloaded_tensor(host)
     hbm = torch.zeros(128 * 1024, dtype=torch.int8, device="npu")
     global_te.register_buffer([hbm.data_ptr()], [hbm.nbytes])
-    reader = DSAPDMooncakeStagingReader(engine, {"host": host, "hbm": hbm}, [[block], [block]], registry=registry)
+    # This byte fixture bypasses the serving Host adapter but uses the same
+    # staging initialization and execution as the concrete SFA reader.
+    reader = MooncakeSFAStagingReader.__new__(MooncakeSFAStagingReader)
+    reader.engine, reader.host_kv = engine, None
+    reader.kv_registry = registry
+    reader.kv_caches = {"host": host, "hbm": hbm}
+    reader.block_len_per_addr = [[block], [block]]
+    reader._init_dsa_pd_mooncake_staging()
     thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
     thread.engine, thread.staging_reader = engine, reader
     thread.tp_rank = thread.pcp_rank = thread.dcp_rank = 0

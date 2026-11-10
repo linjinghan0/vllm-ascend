@@ -20,6 +20,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import (
     MooncakePullConnectorWorker,
     MooncakePullRecvingThread,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import CopySfaTailDest
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import SFAPDRD2HScheduler
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import sparse_kv_offload_manager as manager_module
@@ -30,7 +31,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots i
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import (
     MooncakeSFAHostKV,
     MooncakeSFAPDState,
-    MooncakeSFAStagingReader,
 )
 
 from .mooncake_v2.helpers import make_blocks, make_kv_cache_tensor, make_request, make_sfa_indexer_spec
@@ -237,11 +237,14 @@ def test_real_bytes_land_through_manager_with_existing_pipeline(monkeypatch, pip
     manager, caches = make_manager(blocks=4, k_dim=8192)
     host = MooncakeSFAHostKV(manager, caches)
     engine = MagicMock()
-    reader = MooncakeSFAStagingReader.__new__(MooncakeSFAStagingReader)
-    reader.__dict__.update(make_reader(engine, pipeline=pipeline, window=4).__dict__)
-    reader.host_kv, reader.kv_caches = host, host.transfer_caches
+    runtime = make_reader(engine, pipeline=pipeline, window=4).__dict__
+    monkeypatch.setattr(
+        MooncakeSFAStagingReader,
+        "_init_dsa_pd_mooncake_staging",
+        lambda reader: reader.__dict__.update({key: value for key, value in runtime.items() if key.startswith("_")}),
+    )
+    reader = MooncakeSFAStagingReader(engine, host, [[128 * 8192 * 2], [128 * 4]])
     tensors = [*host.transfer_caches[MAIN], *host.transfer_caches[INDEXER]]
-    reader.block_len_per_addr = [[128 * 8192 * 2], [128 * 4]]
     sources = [torch.full((tensor.nbytes,), i + 1, dtype=torch.int8) for i, tensor in enumerate(tensors)]
     reads = []
 
@@ -448,6 +451,7 @@ def test_real_bucket_direct_hbm_and_host_landing_share_completion(tokens, pipeli
     reader = MooncakeSFAStagingReader.__new__(MooncakeSFAStagingReader)
     reader.__dict__.update(make_reader(engine, pipeline=pipeline, window=4).__dict__)
     reader.host_kv, reader.kv_caches = host, host.transfer_caches
+    reader.kv_registry = host.registry
     reader.block_len_per_addr = [[1024, 512]]
     source_k = torch.arange(40 * 128 * 4, dtype=torch.float32).to(torch.bfloat16).reshape(40, 128, 1, 4)
     source_v = torch.arange(40 * 128 * 2, dtype=torch.float32).neg().to(torch.bfloat16).reshape(40, 128, 1, 2)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DSA Host KV landing shared by the Mooncake pull connectors."""
+"""Mooncake V2 staging and landing into SFA-managed Host KV."""
 
 import threading
 import time
@@ -133,13 +133,21 @@ class _DSAPDMooncakeBankBatchResult:
     land_exposed_secs: float
 
 
-class DSAPDMooncakeStagingMixin:
-    """Own a bounded staging window until every Host KV copy has landed."""
+class MooncakeSFAStagingReader:
+    """Read through a bounded HBM window into the manager's existing Host KV."""
 
     engine: Any
     kv_caches: dict[str, Any]
     block_len_per_addr: list[list[int]]
     kv_registry: MooncakeKVRegistry
+
+    def __init__(self, engine: Any, host_kv: Any, block_lens: list[list[int]]) -> None:
+        self.engine = engine
+        self.host_kv = host_kv
+        self.kv_registry = host_kv.registry
+        self.kv_caches = host_kv.transfer_caches
+        self.block_len_per_addr = block_lens
+        self._init_dsa_pd_mooncake_staging()
 
     def _resolve_host_tensor(self, ptr: int, size: int):
         return self.kv_registry.resolve_offloaded_tensor(ptr, size)
@@ -157,7 +165,7 @@ class DSAPDMooncakeStagingMixin:
         return self.kv_registry.create_transfer_targets(layers)
 
     def get_shared_host_pool(self):
-        return None
+        return self.host_kv
 
     def _init_dsa_pd_mooncake_staging(self) -> None:
         self._dsa_pd_mooncake_staging_storage: torch.Tensor | None = None
@@ -865,24 +873,6 @@ class DSAPDMooncakeStagingMixin:
             len(bank_contexts[0].copy_streams),
         )
         return 0
-
-
-class DSAPDMooncakeStagingReader(DSAPDMooncakeStagingMixin):
-    """V2 adapter; local destinations are the first address list in READ."""
-
-    def __init__(
-        self,
-        engine: Any,
-        kv_caches: dict[str, Any],
-        block_len_per_addr: list[list[int]],
-        *,
-        registry: MooncakeKVRegistry,
-    ) -> None:
-        self.engine = engine
-        self.kv_registry = registry
-        self.kv_caches = kv_caches
-        self.block_len_per_addr = block_len_per_addr
-        self._init_dsa_pd_mooncake_staging()
 
     def get_transfer_targets(
         self, layer_names: list[str], base_addresses: list[list[int]]

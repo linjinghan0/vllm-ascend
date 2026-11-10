@@ -31,7 +31,7 @@ from typing import Any
 import torch
 import torch_npu  # noqa: F401  (must precede mooncake import on Ascend)
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     global_te,
@@ -98,8 +98,9 @@ def run_server(args: argparse.Namespace) -> None:
 
 
 def _make_fake_recv_thread(transfer_engine: Any, staging_bytes: int) -> Any:
-    thread = object.__new__(DSAPDMooncakeStagingReader)
+    thread = object.__new__(MooncakeSFAStagingReader)
     thread.engine = transfer_engine
+    thread.host_kv = None
     thread.kv_registry = registry
     thread.kv_caches = {}
     thread.block_len_per_addr = [[int(staging_bytes)]]

@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import DSAPDMooncakeStagingReader
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import MooncakeKVRegistry
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
     copy_sfa_prefill_dest_geometry,
@@ -162,32 +161,6 @@ class MooncakeSFAHostKV:
         # drain keeps these descriptors alive on both success and failure.
         owners.append((addresses, lengths, count))
         self.manager.copy_sfa_kv(*addresses.unbind(0), lengths, count)
-
-
-class MooncakeSFAStagingReader(DSAPDMooncakeStagingReader):
-    """Keep V2's batching/pipeline; substitute SFA-owned destination and copy APIs."""
-
-    def __init__(self, engine: Any, host_kv: MooncakeSFAHostKV, block_lens: list[list[int]]) -> None:
-        self.host_kv = host_kv
-        super().__init__(engine, host_kv.transfer_caches, block_lens, registry=host_kv.registry)
-
-    def _resolve_host_tensor(self, ptr, size):
-        return self.host_kv.registry.resolve_offloaded_tensor(ptr, size)
-
-    def _resolve_host_bytes(self, ptr, size):
-        return self.host_kv.registry.resolve_offloaded_byte_tensor(ptr, size)
-
-    def _host_register_location(self, ptr, size):
-        return self.host_kv.registry.get_register_location(ptr, size)
-
-    def _prepare_host_targets(self, targets, ptrs, lengths):
-        return self.host_kv.registry.prepare_transfer_targets(targets, ptrs, lengths)
-
-    def _create_host_targets(self, layers):
-        return self.host_kv.registry.create_transfer_targets(layers)
-
-    def get_shared_host_pool(self):
-        return self.host_kv
 
 
 class MooncakeSFAPDState:
