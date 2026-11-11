@@ -1282,26 +1282,38 @@ class MooncakePullRecvingThread(threading.Thread):
 
         # These caches belong to this spec call only. The validation above
         # guarantees that each request has the same block mapping in all layers.
-        block_groups_by_mode: dict[bool, dict[str, tuple[list[list[int]], list[list[int]]]]] = {}
-        shared_block_groups_by_request: dict[
-            str, dict[tuple[int, int, bool], tuple[list[list[int]], list[list[int]]]]
-        ] = {request_id: {} for request_id in block_ids_by_request}
+        block_groups_by_mode: dict[tuple[bool, bool], dict[str, tuple[list[list[int]], list[list[int]]]]] = {}
+        host_kv = getattr(self, "_sfa_host_kv", None)
 
-        def get_block_groups(coalesce: bool) -> dict[str, tuple[list[list[int]], list[list[int]]]]:
-            prepared = block_groups_by_mode.get(coalesce)
+        def get_block_groups(
+            coalesce: bool,
+            local_base_addr: int,
+            local_target: DSAPDMooncakeTransferTarget | None,
+        ) -> dict[str, tuple[list[list[int]], list[list[int]]]]:
+            offloaded = getattr(local_target, "offloaded", None)
+            shared_host = host_kv is not None and (
+                host_kv.contains(local_base_addr) if offloaded is None else offloaded
+            )
+            key = (coalesce, shared_host)
+            prepared = block_groups_by_mode.get(key)
             if prepared is None:
-                prepared = {
-                    request_id: (
-                        group_concurrent_contiguous(local_block_ids, remote_block_ids)
-                        if coalesce
-                        else (
+                prepared = {}
+                for request_id, (local_block_ids, remote_block_ids) in block_ids_by_request.items():
+                    if shared_host:
+                        # Ownership already sorts and coalesces the original pairs;
+                        # grouping them before that only creates work to undo.
+                        groups = partition_shared_block_groups(
+                            [local_block_ids], [remote_block_ids], host_kv.rank, host_kv.size, coalesce=coalesce
+                        )
+                    elif coalesce:
+                        groups = group_concurrent_contiguous(local_block_ids, remote_block_ids)
+                    else:
+                        groups = (
                             [[block_id] for block_id in local_block_ids],
                             [[block_id] for block_id in remote_block_ids],
                         )
-                    )
-                    for request_id, (local_block_ids, remote_block_ids) in block_ids_by_request.items()
-                }
-                block_groups_by_mode[coalesce] = prepared
+                    prepared[request_id] = groups
+                block_groups_by_mode[key] = prepared
             return prepared
 
         remote_tp_metadata = remote_metadata.metadata_by_pcp_rank[remote_pcp_rank].metadata_by_tp_rank[remote_tp_rank]
@@ -1341,8 +1353,13 @@ class MooncakePullRecvingThread(threading.Thread):
                             f"{self.layer_names[local_layer_index]!r}, cache {cache_index}: "
                             f"local={local_block_len}, remote={remote_block_len}"
                         )
+                    if local_block_len <= 0:
+                        continue
+                    local_target = (
+                        self._transfer_targets[local_layer_index][cache_index] if transfer_targets is not None else None
+                    )
                     block_ids_to_transfer = get_block_groups(
-                        local_block_stride == remote_block_stride == local_block_len
+                        local_block_stride == remote_block_stride == local_block_len, local_base_addr, local_target
                     )
                     for request_id, _, _ in transfer_entries:
                         local_block_groups, remote_block_groups = block_ids_to_transfer[request_id]
@@ -1357,16 +1374,10 @@ class MooncakePullRecvingThread(threading.Thread):
                             local_destinations=local_destinations,
                             remote_sources=remote_sources,
                             lengths=lengths,
-                            shared_block_groups=shared_block_groups_by_request[request_id],
-                            **(
-                                {"host_kv": self._sfa_host_kv}
-                                if getattr(self, "_sfa_host_kv", None) is not None
-                                else {}
-                            ),
                             **(
                                 {
                                     "transfer_targets": transfer_targets,
-                                    "local_target": self._transfer_targets[local_layer_index][cache_index],
+                                    "local_target": local_target,
                                 }
                                 if transfer_targets is not None
                                 else {}
@@ -1475,11 +1486,18 @@ class MooncakePullRecvingThread(threading.Thread):
                         f"cache {cache_index}: local={local_head_len}, remote={remote_head_len}"
                     )
                 transfer_len = num_transfer_heads * local_head_len
+                if transfer_len <= 0:
+                    continue
                 local_inner_offset = local_head_offset * local_head_len
                 remote_inner_offset = remote_head_offset * remote_head_len
+                local_target = (
+                    self._transfer_targets[local_layer_index][cache_index] if transfer_targets is not None else None
+                )
                 block_ids_to_transfer = get_block_groups(
                     local_block_stride == local_block_len == transfer_len
-                    and remote_block_stride == remote_block_len == transfer_len
+                    and remote_block_stride == remote_block_len == transfer_len,
+                    local_base_addr,
+                    local_target,
                 )
                 for request_id, _, _ in transfer_entries:
                     local_block_groups, remote_block_groups = block_ids_to_transfer[request_id]
@@ -1496,12 +1514,10 @@ class MooncakePullRecvingThread(threading.Thread):
                         local_destinations=local_destinations,
                         remote_sources=remote_sources,
                         lengths=lengths,
-                        shared_block_groups=shared_block_groups_by_request[request_id],
-                        **({"host_kv": self._sfa_host_kv} if getattr(self, "_sfa_host_kv", None) is not None else {}),
                         **(
                             {
                                 "transfer_targets": transfer_targets,
-                                "local_target": self._transfer_targets[local_layer_index][cache_index],
+                                "local_target": local_target,
                             }
                             if transfer_targets is not None
                             else {}

@@ -174,3 +174,79 @@ def test_shared_plan_keeps_cross_layer_mapping_validation():
             [],
         )
     partition.assert_not_called()
+
+
+@pytest.mark.parametrize("rank", [0, 2, 7])
+@pytest.mark.parametrize("coalesce", [False, True])
+@pytest.mark.parametrize("offloaded", [False, True])
+@pytest.mark.parametrize("with_targets", [False, True])
+def test_host_ownership_uses_raw_pairs_and_bound_target_classification(rank, coalesce, offloaded, with_targets):
+    names = ["layer.0", "layer.1", "layer.2"]
+    local_bases = [[10000, 20000], [100000, 200000], [1000000, 2000000]]
+    remote_bases = [[3000000, 4000000], [5000000, 6000000], [7000000, 8000000]]
+    stride = 128 if coalesce else 256
+    spec = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16)
+    thread = make_thread(
+        layer_names=names,
+        kv_cache_specs=[spec],
+        kv_caches_base_addr=local_bases,
+        block_strides=[[stride, stride]] * 3,
+        block_lens=[[128, 128]] * 3,
+    )
+    remote = make_pp_metadata(
+        layer_names=names,
+        block_strides=[[stride, stride]] * 3,
+        block_lens=[[128, 128]] * 3,
+        tp_base_addrs={0: remote_bases},
+    )
+    targets = [[SimpleNamespace(offloaded=offloaded) for _ in range(2)] for _ in names]
+    thread._transfer_targets = targets
+    pool = SimpleNamespace(rank=rank, size=8, contains=lambda ptr: offloaded)
+    thread._sfa_host_kv = pool
+    entries = [("r", [3, 1, 2, 3, 9], [13, 11, 12, 33, 19])]
+    src, dst, lengths, actual_targets = [], [], [], []
+    with (
+        patch.object(pool, "contains", wraps=pool.contains) as contains,
+        patch.object(
+            pull_worker, "partition_shared_block_groups", wraps=pull_worker.partition_shared_block_groups
+        ) as ownership,
+        patch.object(
+            pull_worker, "group_concurrent_contiguous", wraps=pull_worker.group_concurrent_contiguous
+        ) as group,
+    ):
+        thread._append_spec_transfer_addresses(
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            {(layer, layer): entries for layer in range(3)},
+            remote,
+            src,
+            dst,
+            lengths,
+            **({"transfer_targets": actual_targets} if with_targets else {}),
+        )
+    assert contains.call_count == (0 if with_targets else 6)
+    assert ownership.call_count == int(offloaded)
+    assert group.call_count == int(coalesce and not offloaded)
+    if offloaded:
+        assert ownership.call_args.args[:2] == ([[3, 1, 2, 3, 9]], [[13, 11, 12, 33, 19]])
+        pairs = {0: [(1, 11)], 2: [(3, 13), (3, 33)], 7: []}[rank]
+    else:
+        pairs = [(3, 13), (1, 11), (2, 12), (3, 33), (9, 19)]
+    expected = []
+    for layer in range(3):
+        for component in range(2):
+            for local, peer in pairs:
+                target = targets[layer][component] if with_targets else None
+                expected.extend(
+                    (
+                        local_bases[layer][component] + local * stride + offset,
+                        remote_bases[layer][component] + peer * stride + offset,
+                        target,
+                    )
+                    for offset in range(128)
+                )
+    assert expand_transfers(src, dst, lengths, actual_targets if with_targets else [None] * len(src)) == expected
