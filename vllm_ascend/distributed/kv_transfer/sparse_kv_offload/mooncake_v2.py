@@ -171,8 +171,6 @@ class MooncakeSFAPDState:
         self.bindings: dict[str, int] = {}
         self.pending: set[str] = set()
         self.received: set[str] = set()
-        self.remote: set[str] = set()
-        self.remote_prefixes: dict[str, int] = {}
         self.remote_prefill_tokens: dict[str, int] = {}
         self._metadata: MooncakeConnectorMetadata | None = None
 
@@ -185,51 +183,42 @@ class MooncakeSFAPDState:
         """
         if self._metadata is metadata:
             return
-        self.update(
-            metadata.copy_sfa_slots,
-            list(metadata.requests),
-            {
-                req_id: min(req.num_computed_tokens + req.num_external_tokens, req.local_num_prompt_tokens - 1)
-                for req_id, req in metadata.requests.items()
-            },
-            {
-                req_id: min(req.num_computed_tokens + req.num_external_tokens, req.remote_num_prompt_tokens)
-                for req_id, req in metadata.requests.items()
-            },
-        )
+        prefills = {}
+        for req_id, req in metadata.requests.items():
+            if req.local_num_prompt_tokens != req.remote_num_prompt_tokens:
+                raise ValueError(
+                    "Mooncake V2 Sparse KV offload requires the same original prompt on P and D; "
+                    "appending the producer's first output token is not supported."
+                )
+            prefills[req_id] = min(req.num_computed_tokens + req.num_external_tokens, req.remote_num_prompt_tokens)
+        self.update(metadata.copy_sfa_slots, prefills)
         self._metadata = metadata
 
     def update(
         self,
         bindings: dict[str, int],
-        new_requests: Sequence[str],
-        remote_prefixes: dict[str, int] | None = None,
-        remote_prefill_tokens: dict[str, int] | None = None,
+        remote_prefill_tokens: dict[str, int],
     ) -> None:
         if len(set(bindings.values())) != len(bindings):
             raise ValueError("Mooncake V2 SFA requests cannot share a hot row")
         for req_id, slot in self.bindings.items():
             if req_id in bindings and bindings[req_id] != slot:
                 raise ValueError("Mooncake V2 SFA cannot rebind a live request")
-        if not set(new_requests) <= bindings.keys():
+        if not remote_prefill_tokens.keys() <= bindings.keys():
             raise ValueError("Mooncake V2 SFA transfer is missing its reserved hot row")
         newly_bound = set(bindings) - self.bindings.keys()
         self.bindings = dict(bindings)
         self.pending.intersection_update(bindings)
         self.received.intersection_update(bindings)
-        self.remote.intersection_update(bindings)
-        self.remote.update(new_requests)
-        self.remote_prefixes = {req: count for req, count in self.remote_prefixes.items() if req in bindings}
-        self.remote_prefixes.update(remote_prefixes or {})
         self.remote_prefill_tokens = {
             req: count for req, count in self.remote_prefill_tokens.items() if req in bindings
         }
-        self.remote_prefill_tokens.update(remote_prefill_tokens or {})
-        self.pending.update(newly_bound | set(new_requests))
+        self.remote_prefill_tokens.update(remote_prefill_tokens)
+        self.pending.update(newly_bound | remote_prefill_tokens.keys())
         # A complete local prefix hit needs no READ, but its new hot row still
         # needs initialization from the retained Host blocks before decoding.
-        self.received.update(newly_bound - set(new_requests))
-        self.received.difference_update(new_requests)
+        self.received.update(newly_bound - remote_prefill_tokens.keys())
+        self.received.difference_update(remote_prefill_tokens)
 
     def record_received(self, finished: set[str], failed: set[str]) -> None:
         self.received.update((finished - failed) & self.pending)
@@ -257,15 +246,17 @@ class MooncakeSFAPDState:
             computed = int(computed_tokens[row])
             if computed < 0:
                 raise ValueError("Mooncake V2 SFA computed-token count must be nonnegative")
-            if req_id in self.remote:
-                if computed != self.remote_prefixes.get(req_id, computed):
+            prefilled = self.remote_prefill_tokens.get(req_id)
+            if prefilled is not None:
+                # P contributes prompt KV only. D replays its last prompt token
+                # and generates the complete output, as in the SFA connector.
+                if computed != max(prefilled - 1, 0):
                     raise RuntimeError("Mooncake V2 SFA first decode prefix differs from the received hot/tail prefix")
                 # SFA prefill placement uses the received extent, independently
                 # of V2's first-forward replay prefix. An aligned long prefill
                 # has no PD tail, but replaying its last token needs the previous
                 # block's history. Reuse the existing tail-restore API once.
-                prefilled = self.remote_prefill_tokens.get(req_id, computed)
-                restore_tails |= prefilled > hot_tokens and prefilled % block_size == 0 and computed == prefilled - 1
+                restore_tails |= prefilled > hot_tokens and prefilled % block_size == 0
                 initialized.add(req_id)
                 continue
             dense, tail_tokens, _ = copy_sfa_prefill_dest_geometry(computed, block_size, hot_tokens)
@@ -289,7 +280,5 @@ class MooncakeSFAPDState:
             raise RuntimeError("Mooncake V2 SFA cannot commit initialization before successful receive")
         self.pending.difference_update(initialized)
         self.received.difference_update(initialized)
-        self.remote.difference_update(initialized)
         for req_id in initialized:
-            self.remote_prefixes.pop(req_id, None)
             self.remote_prefill_tokens.pop(req_id, None)

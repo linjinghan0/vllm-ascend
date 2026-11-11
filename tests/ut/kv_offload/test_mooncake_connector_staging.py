@@ -12,6 +12,7 @@ combined-engine facade were rewritten against the main-tree GlobalTE
 import os
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -239,26 +240,55 @@ class TestMooncakeSFAStagingReaderStaging(unittest.TestCase):
         mock_register_buffer.assert_not_called()
 
     def test_coalesce_merges_only_fully_contiguous_neighbours(self):
-        merge = MooncakeSFAStagingReader._coalesce_dsa_pd_mooncake_copy_plan
         chunk = self.staging_chunk_bytes
-        # Fully contiguous run (pool and staging): three entries -> one copy.
+        host = torch.empty(5 * chunk, dtype=torch.int8)
+        staging = torch.empty(3 * chunk, dtype=torch.int8)
+        base = host.data_ptr()
+        banks = (SimpleNamespace(slot_base=0, slot_count=3, copy_streams=()),)
+
+        def copies(transfers):
+            targets = {dst: (host, dst - base) for dst, _, _ in transfers}
+            plan = self.thread._prepare_dsa_pd_mooncake_bank_plan(transfers, targets, staging, chunk, banks)
+            return [
+                (copy.destination, copy.length, copy.staging_offset) for batch in plan.batches for copy in batch.copies
+            ]
+
+        # Split one original range into READ slots, merging only its landing.
         self.assertEqual(
-            merge([(1000, chunk, 0), (1000 + chunk, chunk, chunk), (1000 + 2 * chunk, chunk, 2 * chunk)]),
-            [(1000, 3 * chunk, 0)],
+            copies([(base, 10 * chunk, 3 * chunk)]),
+            [(base, 3 * chunk, 0)],
         )
-        # Pool-contiguous but staging jumps slot (wrapped bank): stays split.
+        # Partial slots leave a staging gap even with contiguous Host targets.
         self.assertEqual(
-            merge([(1000, chunk, 0), (1000 + chunk, chunk, 3 * chunk)]),
-            [(1000, chunk, 0), (1000 + chunk, chunk, 3 * chunk)],
+            copies([(base, 10 * chunk, chunk // 2), (base + chunk // 2, 12 * chunk, chunk // 2)]),
+            [(base, chunk // 2, 0), (base + chunk // 2, chunk // 2, chunk)],
         )
-        # Staging-contiguous but pool target jumps: stays split.
+        # Contiguous staging does not merge a gap in the Host target.
         self.assertEqual(
-            merge([(1000, chunk, 0), (5000, chunk, chunk)]),
-            [(1000, chunk, 0), (5000, chunk, chunk)],
+            copies([(base, 10 * chunk, chunk), (base + 2 * chunk, 11 * chunk, chunk)]),
+            [(base, chunk, 0), (base + 2 * chunk, chunk, chunk)],
         )
-        # Empty and single-entry plans pass through unchanged.
-        self.assertEqual(merge([]), [])
-        self.assertEqual(merge([(1000, chunk, 0)]), [(1000, chunk, 0)])
+        # Reusing a bank starts a new batch, so landing cannot cross it.
+        self.assertEqual(copies([(base, 10 * chunk, 4 * chunk)]), [(base, 3 * chunk, 0), (base + 3 * chunk, chunk, 0)])
+        self.assertEqual(copies([]), [])
+        self.assertEqual(copies([(base, 10 * chunk, chunk)]), [(base, chunk, 0)])
+        self.thread.engine.batch_transfer_sync_read.assert_not_called()
+
+    def test_plan_rejects_coalescing_across_host_tensor_boundary(self):
+        chunk = self.staging_chunk_bytes
+        storage = torch.empty(2 * chunk, dtype=torch.int8)
+        first, second = storage[:chunk], storage[chunk:]
+        staging = torch.empty(2 * chunk, dtype=torch.int8)
+        banks = (SimpleNamespace(slot_base=0, slot_count=2, copy_streams=()),)
+        with self.assertRaisesRegex(RuntimeError, "Host KV tensor boundary"):
+            self.thread._prepare_dsa_pd_mooncake_bank_plan(
+                [(first.data_ptr(), 10 * chunk, chunk), (second.data_ptr(), 11 * chunk, chunk)],
+                {first.data_ptr(): (first, 0), second.data_ptr(): (second, 0)},
+                staging,
+                chunk,
+                banks,
+            )
+        self.thread.engine.batch_transfer_sync_read.assert_not_called()
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.Event")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging.torch.npu.stream")

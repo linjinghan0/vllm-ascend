@@ -129,6 +129,12 @@ existing bounded HBM staging window. Indexer, dense-prefix and circular-tail
 HBM destinations retain their direct READ plans. Completion requires the
 existing landing/event drain before decode can use the received KV.
 
+P and D must receive the same original prompt. Discard P's first output token
+and let D replay the final prompt token and generate the complete output, as
+with the SFA connector. Appending P's first output token to D's prompt is not
+supported with Sparse KV offload and is rejected before receiving KV. Ordinary
+Mooncake transfers retain their existing first-token behavior.
+
 The retired `dsa_sparse_attention_config` is rejected when nonempty. Remove
 its CPU-store and TP-shared-pool settings and use the Manager configuration
 above. The experimental independent Host pool and its V1/V2 allocation

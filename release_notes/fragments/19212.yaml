@@ -1,5 +1,11 @@
 pr: 19212
 entries:
+  - category: config
+    text: >-
+      MooncakeConnectorV2 with Sparse KV offload requires the same original
+      prompt on P and D. D generates the complete output; appending P's first
+      output token to D's prompt is rejected before receiving KV. Ordinary
+      Mooncake transfers retain their existing first-token behavior.
   - category: breaking
     text: >-
       Retired the independent DSA Host KV allocator, TP-shared pool and their

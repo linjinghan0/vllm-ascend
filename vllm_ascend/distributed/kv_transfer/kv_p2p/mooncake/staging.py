@@ -165,26 +165,6 @@ class MooncakeSFAStagingReader:
         )
         return staging
 
-    @staticmethod
-    def _coalesce_dsa_pd_mooncake_copy_plan(copy_plan: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
-        """Merge adjacent plan entries that are contiguous on both sides.
-
-        Consecutive pieces of one layer run are contiguous in the offloaded
-        KV pool; when their remote page offsets are zero they are contiguous
-        in staging too (consecutive slots), so the whole run lands as one
-        copy instead of one copy per 2 MiB piece. Non-contiguous neighbours
-        stay separate entries.
-        """
-        merged: list[tuple[int, int, int]] = []
-        for dst, length, staging_offset in copy_plan:
-            if merged:
-                prev_dst, prev_length, prev_offset = merged[-1]
-                if prev_dst + prev_length == dst and prev_offset + prev_length == staging_offset:
-                    merged[-1] = (prev_dst, prev_length + length, prev_offset)
-                    continue
-            merged.append((dst, length, staging_offset))
-        return merged
-
     def _get_dsa_pd_mooncake_staging_banks(
         self, bank_count: int, bank_window: int, pipeline_active: bool
     ) -> tuple[_DSAPDMooncakeStagingBank, ...]:
@@ -238,30 +218,58 @@ class MooncakeSFAStagingReader:
         staging_chunk_bytes: int,
         banks: tuple[_DSAPDMooncakeStagingBank, ...],
     ) -> _DSAPDMooncakeStagingPlan:
-        """Freeze all READ arguments and validate landing bounds before dispatch."""
+        """Split Host ranges into slots and merge landing copies before dispatch."""
         staging_ptr = int(staging.data_ptr())
+        staging_alignment = 2 * 1024 * 1024
         bank_window = banks[0].slot_count
         batches = []
         intervals = []
-        for batch_start in range(0, len(staged_transfers), bank_window):
-            bank_index = (batch_start // bank_window) % len(banks)
+        transfers = iter(staged_transfers)
+        # A Host range can continue in another batch without materializing its pieces.
+        remaining = 0
+        batch_start = 0
+        while True:
+            bank_index = len(batches) % len(banks)
             bank = banks[bank_index]
             local_staging_ptrs, remote_src_ptrs, transfer_lengths, copy_plan = [], [], [], []
-            for position, (local_dst, remote_src, length) in enumerate(
-                staged_transfers[batch_start : batch_start + bank_window]
-            ):
-                staging_offset = (bank.slot_base + position) * staging_chunk_bytes + remote_src % (2 * 1024 * 1024)
+            for position in range(bank_window):
+                while remaining == 0:
+                    transfer = next(transfers, None)
+                    if transfer is None:
+                        break
+                    local_dst, remote_src, remaining = transfer
+                    target_bytes, target_offset = staged_targets[local_dst]
+                    remote_page_offset = remote_src % staging_alignment
+                if remaining == 0:
+                    break
+                length = min(remaining, staging_chunk_bytes - remote_page_offset)
+                staging_offset = (bank.slot_base + position) * staging_chunk_bytes + remote_page_offset
                 local_staging_ptrs.append(staging_ptr + staging_offset)
                 remote_src_ptrs.append(remote_src)
                 transfer_lengths.append(length)
-                copy_plan.append((local_dst, length, staging_offset))
+                previous = copy_plan[-1] if copy_plan else None
+                if (
+                    previous is not None
+                    and previous[0] + previous[1] == local_dst
+                    and previous[2] + previous[1] == staging_offset
+                ):
+                    copy_plan[-1] = (previous[0], previous[1] + length, previous[2], previous[3], previous[4])
+                else:
+                    copy_plan.append((local_dst, length, staging_offset, target_bytes, target_offset))
+                remaining -= length
+                local_dst += length
+                remote_src += length
+                target_offset += length
+                # A nonfinal piece fills its slot; the next source page is aligned.
+                remote_page_offset = 0
+            if not local_staging_ptrs:
+                break
             copies = []
-            for local_dst, length, staging_offset in self._coalesce_dsa_pd_mooncake_copy_plan(copy_plan):
-                target_bytes, target_offset = staged_targets[local_dst]
+            for destination, length, staging_offset, target_bytes, target_offset in copy_plan:
                 if target_offset + length > target_bytes.numel():
                     raise RuntimeError("Coalesced DSA Mooncake copy crosses a Host KV tensor boundary.")
-                copies.append(_DSAPDMooncakeStagingCopy(local_dst, length, staging_offset, target_bytes))
-                intervals.append((local_dst, local_dst + length, bank_index))
+                copies.append(_DSAPDMooncakeStagingCopy(destination, length, staging_offset, target_bytes))
+                intervals.append((destination, destination + length, bank_index))
             has_overlapping_copies = False
             if len(bank.copy_streams) > 1:
                 furthest_copy_end = -1
@@ -281,6 +289,7 @@ class MooncakeSFAStagingReader:
                     has_overlapping_copies,
                 )
             )
+            batch_start += len(local_staging_ptrs)
         furthest_end, furthest_bank = -1, -1
         overlap = False
         for start, end, bank_index in sorted(intervals):
@@ -548,7 +557,6 @@ class MooncakeSFAStagingReader:
         # The registry drops its views on KV Tensor destruction or reset.
         staged_targets: dict[int, tuple[torch.Tensor, int]] = {}
         staging_chunk_bytes = self._get_dsa_pd_mooncake_staging_chunk_bytes()
-        staging_alignment = 2 * 1024 * 1024
 
         for position, (local_dst, remote_src, length) in enumerate(zip(local_destinations, remote_sources, lengths)):
             resolved = (
@@ -566,20 +574,9 @@ class MooncakeSFAStagingReader:
             target_tensor, target_offset = resolved
             local_dst = int(local_dst)
             remote_src = int(remote_src)
-            remaining = int(length)
-            offset = 0
-            remote_page_offset = remote_src % staging_alignment
-            while remaining > 0:
-                piece_capacity = staging_chunk_bytes - remote_page_offset
-                piece_len = min(remaining, piece_capacity)
-                piece_dst = local_dst + offset
-                staged_transfers.append((piece_dst, remote_src + offset, piece_len))
-                staged_targets[piece_dst] = (target_tensor, target_offset + offset)
-                offset += piece_len
-                remaining -= piece_len
-                # Chunk sizes are alignment multiples. A nonfinal piece fills
-                # its slot, leaving every subsequent source page aligned.
-                remote_page_offset = 0
+            if length > 0:
+                staged_transfers.append((local_dst, remote_src, int(length)))
+                staged_targets[local_dst] = (target_tensor, target_offset)
 
         if direct_local_destinations:
             ret = self.engine.batch_transfer_sync_read(
@@ -674,7 +671,7 @@ class MooncakeSFAStagingReader:
             timing,
             remote_request_id,
             pipeline_active=pipeline_active,
-            chunk_count=len(staged_transfers),
+            chunk_count=int(timing["plan_entries"]),
             banks=bank_contexts,
             workers=workers,
         )

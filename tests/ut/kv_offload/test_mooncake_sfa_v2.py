@@ -291,12 +291,13 @@ def test_real_bytes_land_through_manager_with_existing_pipeline(monkeypatch, pip
 @pytest.mark.parametrize("tokens", [0, 1, 127, 128, 129, 2047, 2048, 2049, 2176, 2177])
 def test_first_decode_preparation_is_local_and_once_per_request(tokens):
     state = MooncakeSFAPDState(main_group_id=1)
-    state.update({"r": 2}, ["r"])
+    computed = max(tokens - 1, 0)
+    state.update({"r": 2}, {"r": tokens})
     with pytest.raises(RuntimeError, match="receive completed"):
-        state.prepare(["r"], [2], [tokens], block_size=128, hot_tokens=2048)
+        state.prepare(["r"], [2], [computed], block_size=128, hot_tokens=2048)
     state.record_received({"r"}, set())
-    restore, dense, initialized = state.prepare(["r"], [2], [tokens], block_size=128, hot_tokens=2048)
-    assert restore is False
+    restore, dense, initialized = state.prepare(["r"], [2], [computed], block_size=128, hot_tokens=2048)
+    assert restore == (tokens > 2048 and tokens % 128 == 0)
     assert dense == {}
     assert initialized == {"r"}
     # Preparation is committed only after metadata/copy submission succeeds.
@@ -307,12 +308,12 @@ def test_first_decode_preparation_is_local_and_once_per_request(tokens):
 
 def test_receive_failure_cancellation_and_row_reuse_do_not_publish_stale_readiness():
     state = MooncakeSFAPDState(0)
-    state.update({"old": 0}, ["old"])
+    state.update({"old": 0}, {"old": 128})
     state.record_received({"old"}, {"old"})
     assert not state.received
-    state.update({}, [])
+    state.update({}, {})
     state.record_received({"old"}, set())
-    state.update({"new": 0}, ["new"])
+    state.update({"new": 0}, {"new": 128})
     assert state.pending == {"new"} and not state.received
     with pytest.raises(RuntimeError, match="receive completed"):
         state.prepare(["new"], [0], [128], block_size=128, hot_tokens=2048)
@@ -320,7 +321,7 @@ def test_receive_failure_cancellation_and_row_reuse_do_not_publish_stale_readine
 
 def test_complete_local_prefix_hit_initializes_its_new_row_without_read():
     state = MooncakeSFAPDState(0)
-    state.update({"hit": 1}, [])
+    state.update({"hit": 1}, {})
     assert state.prepare(["hit"], [1], [128], block_size=128, hot_tokens=2048) == (False, {1: (0, 128)}, {"hit"})
 
 
@@ -529,13 +530,13 @@ def test_real_bucket_direct_hbm_and_host_landing_share_completion(tokens, pipeli
 
 def test_remote_pd_prefix_must_match_first_decode_and_cancel_releases_it():
     state = MooncakeSFAPDState(1)
-    state.update({"r": 0}, ["r"], {"r": 2175})
+    state.update({"r": 0}, {"r": 2176})
     state.record_received({"r"}, set())
     with pytest.raises(RuntimeError, match="prefix differs"):
         state.prepare(["r"], [0], [2176], block_size=128, hot_tokens=2048)
-    assert state.prepare(["r"], [0], [2175], block_size=128, hot_tokens=2048) == (False, {}, {"r"})
-    state.update({}, [])
-    assert not state.remote and not state.remote_prefixes
+    assert state.prepare(["r"], [0], [2175], block_size=128, hot_tokens=2048) == (True, {}, {"r"})
+    state.update({}, {})
+    assert not state.remote_prefill_tokens
 
 
 def test_partial_local_prefix_still_primes_whole_dense_row_from_producer():
@@ -593,24 +594,23 @@ def test_cancelled_pd_holds_hot_row_until_all_receivers_finish(failed):
 
 
 @pytest.mark.parametrize("tokens", [1, 128, 129, 2048, 2049, 2175, 2176, 2177, 2304, 2305, 4096, 4097])
-@pytest.mark.parametrize("replay", [False, True])
-def test_received_extent_and_first_execution_prefix_have_separate_lifetimes(tokens, replay):
+def test_received_extent_and_first_execution_prefix_have_separate_lifetimes(tokens):
     state = MooncakeSFAPDState(1)
-    computed = tokens - int(replay)
-    state.update({"r": 0}, ["r"], {"r": computed}, {"r": tokens})
+    computed = tokens - 1
+    state.update({"r": 0}, {"r": tokens})
     state.record_received({"r"}, set())
     restore, dense, initialized = state.prepare(["r"], [0], [computed], block_size=128, hot_tokens=2048)
-    assert restore == (replay and tokens > 2048 and tokens % 128 == 0)
+    assert restore == (tokens > 2048 and tokens % 128 == 0)
     assert dense == {} and initialized == {"r"}
     state.commit(initialized)
-    assert not state.remote_prefill_tokens and not state.remote_prefixes
+    assert not state.remote_prefill_tokens
     assert state.prepare(["r"], [0], [computed + 1], block_size=128, hot_tokens=2048) == (False, {}, set())
-    state.update({"cancelled": 0}, ["cancelled"], {"cancelled": 2175}, {"cancelled": 2176})
-    state.update({}, [])
-    assert not state.remote_prefill_tokens and not state.remote_prefixes
+    state.update({"cancelled": 0}, {"cancelled": 2176})
+    state.update({}, {})
+    assert not state.remote_prefill_tokens
 
 
-def test_worker_keeps_producer_extent_separate_from_continuation_input():
+def test_worker_rejects_appended_producer_first_token_before_binding():
     worker = MooncakePullConnectorWorker.__new__(MooncakePullConnectorWorker)
     worker._sfa_pd_state = MooncakeSFAPDState(1)
     meta = MooncakeConnectorMetadata()
@@ -618,9 +618,27 @@ def test_worker_keeps_producer_extent_separate_from_continuation_input():
     meta.requests["r"] = SimpleNamespace(
         num_computed_tokens=0, num_external_tokens=2177, local_num_prompt_tokens=2177, remote_num_prompt_tokens=2176
     )
-    worker.prepare_sparse_kv_offload(meta)
-    assert worker._sfa_pd_state.remote_prefill_tokens == {"r": 2176}
-    assert worker._sfa_pd_state.remote_prefixes == {"r": 2176}
+    with pytest.raises(ValueError, match="same original prompt"):
+        worker.prepare_sparse_kv_offload(meta)
+    assert not worker._sfa_pd_state.bindings and not worker._sfa_pd_state.pending
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("append_token", [False, True])
+def test_first_token_policy_is_limited_to_sparse_offload(offload, append_token):
+    scheduler = make_pull_scheduler()
+    scheduler._copy_sfa_slot_allocator = CopySfaTopkSlotAllocator(1) if offload else None
+    tokens = list(range(32)) + ([777] if append_token else [])
+    request = make_request(
+        prompt_token_ids=tokens,
+        kv_transfer_params={"do_remote_prefill": True, "remote_num_prompt_tokens": 32, "last_token_id": 777},
+    )
+    if offload and append_token:
+        with pytest.raises(ValueError, match="producer's first output token"):
+            scheduler.get_num_new_matched_tokens(request, 0)
+        assert not scheduler._copy_sfa_slot_allocator.bound_slots()
+    else:
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (len(tokens), True)
 
 
 def test_handoff_commit_retains_pending_on_missing_tail_and_rejects_failed_receive():
@@ -646,4 +664,4 @@ def test_handoff_commit_retains_pending_on_missing_tail_and_rejects_failed_recei
     state.bind_metadata(replacement)
     state.record_received({"r"}, set())
     assert state.pending == state.received == {"next"}
-    assert not state.remote_prefixes and not state.remote_prefill_tokens
+    assert not state.remote_prefill_tokens

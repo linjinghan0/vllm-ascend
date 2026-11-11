@@ -49,16 +49,21 @@ two-block circular tail. An aligned long prefix requires no tail READ. These
 HBM reads are replicated on every D TP rank, independently of shared Host block
 ownership. Like the existing SFA scheduler, placement uses the entire received
 KV extent (`computed + external`, bounded by the producer's valid KV count),
-without subtracting a replayed prompt token. A producer-generated token appended
-to D's input is not part of the producer's prompt KV.
+without subtracting a replayed prompt token.
+
+P and D must receive the same original prompt. Discard P's first output token;
+D replays the final prompt token and generates the complete output, as with the
+existing SFA connector. Appending P's first output token to D's prompt is rejected
+before receiving KV. Ordinary Mooncake transfers retain their existing
+first-token behavior.
 
 The existing V2 batch READ and bounded staging pipeline still land Host main
 KV through the SFA manager's local-copy API. Receive completion includes both
 direct HBM reads and the final Host staging drain. After all TP workers complete
 PD, the first real decode validates the reservation and expected execution
-prefix. The scheduler may replay the last prompt token; this does not change
-PD placement. If a long received extent is block-aligned and its last token is
-replayed, PD has no incomplete tail but that forward needs the preceding
+prefix. The scheduler replays the last prompt token; this does not change
+PD placement. If a long received extent is block-aligned,
+PD has no incomplete tail but that forward needs the preceding
 partial block. The V2 adapter restores that history once through the existing
 manager tail-copy API before eager execution or graph replay. Other remote
 receives do not repeat Host-to-hot initialization. Complete local prefix hits

@@ -600,11 +600,17 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
 
         if params is not None and params.get("do_remote_prefill"):
             allocator = getattr(self, "_copy_sfa_slot_allocator", None)
+            token_ids = request.prompt_token_ids or []
+            remote_prompt_tokens = params.get("remote_num_prompt_tokens")
+            if allocator is not None and remote_prompt_tokens is not None and len(token_ids) != remote_prompt_tokens:
+                raise ValueError(
+                    "Mooncake V2 Sparse KV offload requires the same original prompt on P and D; "
+                    "appending the producer's first output token is not supported."
+                )
             if allocator is not None and not allocator.can_bind(request.request_id):
                 # Waiting async receivers do not count towards max_num_seqs.
                 # Defer before KV allocation, matching SFA's row admission.
                 return None, False
-            token_ids = request.prompt_token_ids or []
             actual = self._state_prefill_token_count(len(token_ids))
             params["num_computed_tokens"] = num_computed_tokens
             count = max(actual - num_computed_tokens, 0)

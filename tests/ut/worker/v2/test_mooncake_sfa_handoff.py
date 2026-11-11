@@ -19,7 +19,7 @@ from vllm_ascend.worker.v2.model_states import default
 @pytest.mark.parametrize("local_hit", [False, True])
 def test_first_real_decode_primes_correct_group_before_graph_or_eager_forward(monkeypatch, computed, mode, local_hit):
     pd = MooncakeSFAPDState(main_group_id=1)
-    pd.update({"r": 2}, [] if local_hit else ["r"], {"r": computed}, {"r": computed + 1})
+    pd.update({"r": 2}, {} if local_hit else {"r": computed + 1})
     pd.record_received({"r"}, set())
     cfg = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=128),
