@@ -1,6 +1,8 @@
 pr: 19212
 entries:
   - category: bugfix
+    text: Retained Mooncake Host landing resources after failed NPU waits and deferred receive completion until pending copies were drained.
+  - category: bugfix
     text: Rejected overlapping Mooncake V2 Host destinations before starting a receive, including any direct HBM reads in a mixed transfer.
   - category: bugfix
     text: Preserved late Mooncake staging registrations and CPU location hints across sleep and wake cycles, including retries after partial registration failures.

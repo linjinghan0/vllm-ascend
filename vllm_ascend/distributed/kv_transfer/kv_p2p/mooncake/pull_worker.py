@@ -52,6 +52,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
 )
 
 _BULK_TRANSFER_ADDRESS_GROUPS = 32
+_STAGING_DRAIN_RETRY_INTERVAL_SECONDS = 10
 
 
 def _build_block_transfer_addresses(
@@ -219,13 +220,8 @@ class MooncakePullRecvingThread(threading.Thread):
                     remote_port,
                     requests,
                 )
-                for request_id in failed_request_ids:
-                    self._mark_request_failed(requests[request_id])
             except Exception as exc:
                 failed_request_ids = set(requests)
-                if self.can_report_invalid_block_ids:
-                    for request_metadata in requests.values():
-                        self._mark_request_failed(request_metadata)
                 logger.exception(
                     "Mooncake pull failed for remote engine %s at %s, marking batch requests failed: %s; error=%s",
                     remote_engine_id,
@@ -234,9 +230,29 @@ class MooncakePullRecvingThread(threading.Thread):
                     exc,
                 )
             finally:
+                # Completion permits the scheduler to recycle Host blocks and
+                # hot rows, including on failure or cancellation. A failed NPU
+                # wait does not prove the submitted copies have stopped.
+                self._wait_for_pending_landing()
+                for request_id in failed_request_ids:
+                    self._mark_request_failed(requests[request_id])
                 for request_id in requests:
                     self.finished_requests.put((request_id, request_id in failed_request_ids))
                 self.request_queue.task_done()
+
+    def _wait_for_pending_landing(self) -> None:
+        if self.staging_reader is None:
+            return
+        while True:
+            try:
+                self.staging_reader.drain_pending_landing()
+                return
+            except Exception:
+                logger.exception(
+                    "Mooncake Host landing drain failed; retaining request resources and retrying in %s seconds",
+                    _STAGING_DRAIN_RETRY_INTERVAL_SECONDS,
+                )
+                time.sleep(_STAGING_DRAIN_RETRY_INTERVAL_SECONDS)
 
     def _mark_request_failed(self, request_metadata: ReqMeta) -> None:
         if not self.can_report_invalid_block_ids:

@@ -37,6 +37,7 @@ class _DSAPDMooncakeStagingBank:
     completion_pending: bool = False
     inflight_owners: list[tuple[torch.Tensor, ...]] = field(default_factory=list)
     needs_stream_drain: bool = False
+    pending_device: torch.device | None = None
 
 
 class _DSAPDMooncakeStagingCopy(NamedTuple):
@@ -335,10 +336,16 @@ class MooncakeSFAStagingReader:
                 raise
         else:
             land_started = time.perf_counter()
+            # Synchronous landing uses the caller's current stream, rather
+            # than the bank streams. Retain its owners until a device wait
+            # succeeds, even if landing or synchronization raises.
+            bank.inflight_owners.append((staging, *(copy.target_bytes for copy in batch.copies)))
+            bank.pending_device = staging.device
             try:
                 self.host_kv.land(batch.copies, staging, bank.inflight_owners)
             finally:
-                torch.npu.synchronize()
+                torch.npu.synchronize(bank.pending_device)
+                bank.pending_device = None
                 bank.inflight_owners.clear()
             land_exposed_secs += time.perf_counter() - land_started
         return _DSAPDMooncakeBankBatchResult(ret, read_secs, read_settle_secs, land_exposed_secs)
@@ -377,13 +384,25 @@ class MooncakeSFAStagingReader:
                 except Exception as error:
                     if bank_error is None:
                         bank_error = error
-            if not bank.needs_stream_drain and not bank.completion_pending:
+            if bank.pending_device is not None:
+                try:
+                    torch.npu.synchronize(bank.pending_device)
+                    bank.pending_device = None
+                except Exception as error:
+                    if bank_error is None:
+                        bank_error = error
+            if not bank.needs_stream_drain and not bank.completion_pending and bank.pending_device is None:
                 bank.inflight_owners.clear()
             # A failed wait on one bank must not skip the other banks.
             if first_error is None and bank_error is not None:
                 first_error = bank_error
         if first_error is not None:
             raise first_error
+
+    def drain_pending_landing(self) -> None:
+        """Confirm all submitted Host copies have stopped before releasing KV."""
+        with self._dsa_pd_mooncake_staging_lock:
+            self._drain_dsa_pd_mooncake_staging_banks(self._dsa_pd_mooncake_staging_banks)
 
     def _get_dsa_pd_mooncake_bank_workers(self, banks: tuple[_DSAPDMooncakeStagingBank, ...]) -> int:
         """Use one worker per effective bank; keep a single bank on the caller."""
