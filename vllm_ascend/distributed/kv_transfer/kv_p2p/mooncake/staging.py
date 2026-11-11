@@ -57,14 +57,11 @@ class _DSAPDMooncakeBankBatch(NamedTuple):
     remote_src_ptrs: list[int]
     transfer_lengths: list[int]
     copies: tuple[_DSAPDMooncakeStagingCopy, ...]
-    has_overlapping_copies: bool = False
 
 
 @dataclass(frozen=True)
 class _DSAPDMooncakeStagingPlan:
     batches: tuple[_DSAPDMooncakeBankBatch, ...]
-    # Future schedulers must preserve serial order for overlapping bank writes.
-    has_cross_bank_overlap: bool
 
 
 @dataclass(frozen=True)
@@ -218,7 +215,7 @@ class MooncakeSFAStagingReader:
         staging_chunk_bytes: int,
         banks: tuple[_DSAPDMooncakeStagingBank, ...],
     ) -> _DSAPDMooncakeStagingPlan:
-        """Split Host ranges into slots and merge landing copies before dispatch."""
+        """Split Host ranges, merge copies, and reject conflicting destinations."""
         staging_ptr = int(staging.data_ptr())
         staging_alignment = 2 * 1024 * 1024
         bank_window = banks[0].slot_count
@@ -269,15 +266,7 @@ class MooncakeSFAStagingReader:
                 if target_offset + length > target_bytes.numel():
                     raise RuntimeError("Coalesced DSA Mooncake copy crosses a Host KV tensor boundary.")
                 copies.append(_DSAPDMooncakeStagingCopy(destination, length, staging_offset, target_bytes))
-                intervals.append((destination, destination + length, bank_index))
-            has_overlapping_copies = False
-            if len(bank.copy_streams) > 1:
-                furthest_copy_end = -1
-                for copy in sorted(copies, key=lambda item: item.destination):
-                    if copy.destination < furthest_copy_end:
-                        has_overlapping_copies = True
-                        break
-                    furthest_copy_end = max(furthest_copy_end, copy.destination + copy.length)
+                intervals.append((destination, destination + length))
             batches.append(
                 _DSAPDMooncakeBankBatch(
                     batch_start,
@@ -286,19 +275,15 @@ class MooncakeSFAStagingReader:
                     remote_src_ptrs,
                     transfer_lengths,
                     tuple(copies),
-                    has_overlapping_copies,
                 )
             )
             batch_start += len(local_staging_ptrs)
-        furthest_end, furthest_bank = -1, -1
-        overlap = False
-        for start, end, bank_index in sorted(intervals):
-            if start < furthest_end and bank_index != furthest_bank:
-                overlap = True
-                break
-            if end > furthest_end:
-                furthest_end, furthest_bank = end, bank_index
-        return _DSAPDMooncakeStagingPlan(tuple(batches), overlap)
+        previous_end = -1
+        for start, end in sorted(intervals):
+            if start < previous_end:
+                raise ValueError("Overlapping Mooncake Host destination ranges are not supported.")
+            previous_end = end
+        return _DSAPDMooncakeStagingPlan(tuple(batches))
 
     def _execute_dsa_pd_mooncake_bank_batch(
         self,
@@ -326,7 +311,7 @@ class MooncakeSFAStagingReader:
             bank.needs_stream_drain = True
             try:
                 streams = bank.copy_streams or (bank.stream,)
-                count = 1 if batch.has_overlapping_copies else min(len(streams), max(1, len(batch.copies)))
+                count = min(len(streams), max(1, len(batch.copies)))
                 for index, stream in enumerate(streams[:count]):
                     with torch.npu.stream(stream):
                         self.host_kv.land(batch.copies[index::count], staging, bank.inflight_owners)
@@ -578,17 +563,13 @@ class MooncakeSFAStagingReader:
                 staged_transfers.append((local_dst, remote_src, int(length)))
                 staged_targets[local_dst] = (target_tensor, target_offset)
 
-        if direct_local_destinations:
-            ret = self.engine.batch_transfer_sync_read(
-                session_id,
-                direct_local_destinations,
-                direct_remote_sources,
-                direct_lengths,
-            )
-            if ret < 0:
-                return ret
-
         if not staged_transfers:
+            if direct_local_destinations:
+                ret = self.engine.batch_transfer_sync_read(
+                    session_id, direct_local_destinations, direct_remote_sources, direct_lengths
+                )
+                if ret < 0:
+                    return ret
             return 0
 
         staging = self._ensure_dsa_pd_mooncake_staging_tensor()
@@ -628,25 +609,23 @@ class MooncakeSFAStagingReader:
             plan = self._prepare_dsa_pd_mooncake_bank_plan(
                 staged_transfers, staged_targets, staging, staging_chunk_bytes, bank_contexts
             )
-            if (
-                pipeline_active
-                and not plan.has_cross_bank_overlap
-                and not ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE
-            ):
+            # Validate every Host destination before a mixed receive writes HBM.
+            if direct_local_destinations:
+                ret = self.engine.batch_transfer_sync_read(
+                    session_id, direct_local_destinations, direct_remote_sources, direct_lengths
+                )
+                if ret < 0:
+                    return ret
+            if pipeline_active and not ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE:
                 workers = self._get_dsa_pd_mooncake_bank_workers(bank_contexts)
             if workers:
                 batch_results = self._execute_dsa_pd_mooncake_bank_workers(
                     session_id, plan, bank_contexts, staging, remote_request_id, workers
                 )
             else:
-                # Preserve caller-thread READ order for the original control,
-                # overlapping destinations, and device-wide READ probe runs.
+                # Keep the synchronous control and device-wide probe on the caller.
                 def serial_batches() -> Iterator[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]]:
                     for batch in plan.batches:
-                        if plan.has_cross_bank_overlap:
-                            # Serial Host submission alone does not order two
-                            # streams writing overlapping destination bytes.
-                            self._drain_dsa_pd_mooncake_staging_banks(bank_contexts)
                         yield (
                             batch,
                             self._execute_dsa_pd_mooncake_bank_batch(

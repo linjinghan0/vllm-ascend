@@ -90,14 +90,15 @@ def test_single_copy_does_not_wait_on_unused_auxiliary_events(monkeypatch):
     case.runtime.assert_drained()
 
 
-def test_overlapping_copies_preserve_original_write_order(monkeypatch):
+def test_overlapping_copies_are_rejected_before_any_read(monkeypatch):
     case = build(monkeypatch, copy_streams=4)
     case.runtime.workers = 0
     case.runtime.barrier = None
     args = (case.args[0], [case.host.data_ptr() + 16] * case.count, *case.args[2:])
-    assert case.reader.batch_transfer_sync_read(*args, **case.kwargs) == 0
-    assert torch.equal(case.host[16 : 16 + PIECE_BYTES], case.source[-PIECE_BYTES:])
-    assert all(bank == stream for bank, stream, _thread in case.runtime.copy_submissions)
+    with pytest.raises(ValueError, match="Overlapping Mooncake Host destination"):
+        case.reader.batch_transfer_sync_read(*args, **case.kwargs)
+    assert not case.runtime.reads and not case.runtime.copy_submissions
+    assert not torch.count_nonzero(case.host)
     case.runtime.assert_drained()
 
 

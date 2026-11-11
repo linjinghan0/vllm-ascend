@@ -180,17 +180,22 @@ def test_layout_change_drains_previous_bank_events_before_replacement():
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_plan_marks_cross_bank_dependencies_and_keeps_batch_order(overlap):
+def test_plan_rejects_overlaps_and_preserves_disjoint_batch_order(overlap):
     reader = make_reader(MagicMock(), pipeline=True, kv_registry=registry)
     banks = reader._get_dsa_pd_mooncake_staging_banks(2, 1, True)
     host = torch.empty(64, dtype=torch.int8)
-    destinations = [host.data_ptr(), host.data_ptr() + (8 if overlap else 16), host.data_ptr()]
+    destinations = [host.data_ptr(), host.data_ptr() + (8 if overlap else 16), host.data_ptr() + 32]
     transfers = [(dst, (index + 10) * ALIGNMENT, 16) for index, dst in enumerate(destinations)]
     targets = {dst: (host, dst - host.data_ptr()) for dst in destinations}
+    if overlap:
+        with pytest.raises(ValueError, match="Overlapping Mooncake Host destination"):
+            reader._prepare_dsa_pd_mooncake_bank_plan(
+                transfers, targets, reader._dsa_pd_mooncake_staging_tensor, ALIGNMENT, banks
+            )
+        return
     plan = reader._prepare_dsa_pd_mooncake_bank_plan(
         transfers, targets, reader._dsa_pd_mooncake_staging_tensor, ALIGNMENT, banks
     )
-    assert plan.has_cross_bank_overlap is overlap
     assert [batch.bank_index for batch in plan.batches] == [0, 1, 0]
     assert [copy.destination for batch in plan.batches for copy in batch.copies] == destinations
 

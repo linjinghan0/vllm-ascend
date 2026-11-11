@@ -465,20 +465,12 @@ def test_second_request_cannot_enter_until_failed_request_has_joined(monkeypatch
     case.runtime.assert_drained()
 
 
-@pytest.mark.parametrize("reason", ["overlap", "probe", "pipeline_off"])
+@pytest.mark.parametrize("reason", ["probe", "pipeline_off"])
 def test_worker_setting_retains_serial_fallbacks(monkeypatch, reason):
     case = build(monkeypatch, 4)
     case.runtime.workers = 0
     case.runtime.barrier = None
-    if reason == "overlap":
-        plan = case.reader._prepare_dsa_pd_mooncake_bank_plan
-
-        def overlapping(*args):
-            result = plan(*args)
-            return staging_module._DSAPDMooncakeStagingPlan(result.batches, True)
-
-        case.reader._prepare_dsa_pd_mooncake_bank_plan = overlapping
-    elif reason == "probe":
+    if reason == "probe":
         monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
     else:
         case.reader._pipeline_landing_enabled = False
@@ -488,18 +480,16 @@ def test_worker_setting_retains_serial_fallbacks(monkeypatch, reason):
     case.runtime.assert_drained()
 
 
-def test_overlapping_destinations_wait_for_prior_stream_before_next_batch(monkeypatch):
+def test_overlapping_destinations_are_rejected_before_workers_start(monkeypatch):
     case = build(monkeypatch, 4)
     case.runtime.workers = 0
     case.runtime.barrier = None
     destinations = [case.host.data_ptr() + 16] * case.count
     args = (case.args[0], destinations, *case.args[2:])
-    assert case.reader.batch_transfer_sync_read(*args, **case.kwargs) == 0
-    assert not case.runtime.threads
-    assert torch.equal(case.host[16 : 16 + PIECE_BYTES], case.source[-PIECE_BYTES:])
-    assert torch.count_nonzero(case.host[:16]) == 0
-    assert torch.count_nonzero(case.host[16 + PIECE_BYTES :]) == 0
-    assert [row[1] for row in case.runtime.reads] == [index % BANKS for index in range(len(case.runtime.reads))]
+    with pytest.raises(ValueError, match="Overlapping Mooncake Host destination"):
+        case.reader.batch_transfer_sync_read(*args, **case.kwargs)
+    assert not case.runtime.threads and not case.runtime.reads and not case.runtime.copy_submissions
+    assert not torch.count_nonzero(case.host)
     case.runtime.assert_drained()
 
 
@@ -573,14 +563,12 @@ def test_effective_banks_select_workers_and_preserve_bytes(
     case.runtime.assert_drained()
 
 
-@pytest.mark.parametrize("reason", ["overlap", "probe", "pipeline_off"])
+@pytest.mark.parametrize("reason", ["probe", "pipeline_off"])
 def test_automatic_workers_retain_serial_fallbacks(monkeypatch, reason):
     case = build(monkeypatch)
     case.runtime.workers = 0
     case.runtime.barrier = None
-    if reason == "overlap":
-        case.args = (case.args[0], [case.host.data_ptr() + 16] * case.count, *case.args[2:])
-    elif reason == "probe":
+    if reason == "probe":
         monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
     else:
         case.reader._pipeline_landing_enabled = False
