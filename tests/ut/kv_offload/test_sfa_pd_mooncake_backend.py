@@ -167,6 +167,11 @@ def test_runtime_landing_uses_shared_pool_copy_and_synchronizes_before_return():
     raw = MagicMock()
     raw.batch_transfer_sync_read.return_value = 0
     stream = MagicMock()
+    current_stream = object()
+    order = []
+    stream.wait_stream.side_effect = lambda waited: order.append("wait")
+    manager.copy_sfa_kv.side_effect = lambda *args: order.append("copy")
+    stream.synchronize.side_effect = lambda: order.append("synchronize")
     real_device = torch.device
 
     def cpu_device(*args, **kwargs):
@@ -174,8 +179,11 @@ def test_runtime_landing_uses_shared_pool_copy_and_synchronizes_before_return():
 
     with (
         patch("torch.device", side_effect=cpu_device),
-        patch("torch.npu.current_device", return_value=0),
-        patch("torch.npu.Stream", return_value=stream),
+        # Patch the object the backend uses; another UT may replace
+        # torch.npu while sys.modules["torch.npu"] still holds an older mock.
+        patch.object(torch.npu, "current_device", return_value=0),
+        patch.object(torch.npu, "current_stream", return_value=current_stream),
+        patch.object(torch.npu, "Stream", return_value=stream) as create_stream,
         patch(_MODULE + ".get_device_cache_regions", return_value=device_regions),
         patch("vllm_ascend.distributed.kv_transfer.utils.utils.validate_register_region_count"),
         patch(_TE + ".register_buffer") as register,
@@ -193,8 +201,10 @@ def test_runtime_landing_uses_shared_pool_copy_and_synchronizes_before_return():
     assert dst.tolist() == [_HOST + 8]
     assert lengths.tolist() == [12]
     assert count.tolist() == [1]
-    stream.wait_stream.assert_called_once()
-    stream.synchronize.assert_called_once()
+    create_stream.assert_called_once_with()
+    stream.wait_stream.assert_called_once_with(current_stream)
+    stream.synchronize.assert_called_once_with()
+    assert order == ["wait", "copy", "synchronize"]
 
 
 def _config(backend):
