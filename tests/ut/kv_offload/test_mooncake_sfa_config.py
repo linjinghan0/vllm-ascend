@@ -25,13 +25,13 @@ def config(dsa=None):
             pipeline_parallel_size=1,
         ),
         speculative_config=None,
+        use_v2_model_runner=True,
     )
 
 
 @pytest.fixture(autouse=True)
 def v2_a3(monkeypatch):
     monkeypatch.setattr(ascend_config, "is_950", lambda: False)
-    monkeypatch.setattr(vllm.envs, "VLLM_USE_V2_MODEL_RUNNER", True)
 
 
 def test_v2_consumer_selects_existing_lim_copy_backend():
@@ -45,10 +45,17 @@ def test_rejects_two_host_pool_owners(legacy):
         SparseKVOffloadConfig.from_additional_config(config(legacy), {"enabled": True})
 
 
-def test_rejects_model_runner_v1(monkeypatch):
-    monkeypatch.setattr(vllm.envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+def test_rejects_model_runner_v1():
+    cfg = config()
+    cfg.use_v2_model_runner = False
     with pytest.raises(ValueError, match="ModelRunner V2"):
-        SparseKVOffloadConfig.from_additional_config(config(), {"enabled": True})
+        SparseKVOffloadConfig.from_additional_config(cfg, {"enabled": True})
+
+
+def test_accepts_v2_after_upstream_removes_runner_environment_entry(monkeypatch):
+    monkeypatch.delitem(vllm.envs.environment_variables, "VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    resolved = SparseKVOffloadConfig.from_additional_config(config(), {"enabled": True})
+    assert resolved.enabled and resolved.use_fused_copy_sfa
 
 
 def test_rejects_unadapted_overlap_backend():

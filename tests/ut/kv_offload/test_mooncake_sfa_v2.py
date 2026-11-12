@@ -10,11 +10,13 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.request import RequestStatus
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import base_worker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import MooncakeBaseConnectorWorker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector import MooncakePullConnector
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.heartbeat import MooncakeHeartbeatThread
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import MooncakeConnectorMetadata
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import (
     MooncakePullConnectorWorker,
@@ -34,7 +36,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import (
 )
 
 from .mooncake_v2.helpers import make_blocks, make_kv_cache_tensor, make_request, make_sfa_indexer_spec
-from .mooncake_v2.test_pull_scheduler import make_pull_scheduler
+from .mooncake_v2.test_pull_scheduler import heartbeat_request, make_pull_scheduler
 from .test_dsa_pd_mooncake_connector_v2 import make_reader
 from .test_sfa_pd_rd2h_connector import _make_layer, _make_tail_read_thread
 
@@ -166,6 +168,7 @@ def test_v2_registration_publishes_only_persistent_components(monkeypatch):
     )
     worker.pcp_rank = worker.tp_rank = 0
     worker.tp_size = 2
+    worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16))
     worker.engine_id, worker.te_rpc_port = "consumer", 9000
     worker.block_size, worker.side_channel_host, worker.handshake_port = 128, "127.0.0.1", 5000
     worker.register_kv_caches(caches)
@@ -576,21 +579,50 @@ def test_direct_hot_reads_require_valid_reserved_row(slot):
 def test_cancelled_pd_holds_hot_row_until_all_receivers_finish(failed):
     scheduler = make_pull_scheduler()
     scheduler._copy_sfa_slot_allocator = CopySfaTopkSlotAllocator(1)
-    scheduler._copy_sfa_slot_allocator.bind("cancelled")
-    scheduler._reqs_recv_info["cancelled"] = ("peer", 9, "p-r")
+    scheduler._heartbeat_thread = MooncakeHeartbeatThread(5)
     scheduler._recving_thread = MagicMock()
     scheduler.kv_transfer_config = SimpleNamespace(kv_load_failure_policy="fail")
-    request = make_request(request_id="cancelled", kv_transfer_params={"do_remote_prefill": False})
+    request = heartbeat_request(request_id="cancelled", remote_num_prompt_tokens=32)
+    scheduler.on_new_request(request)
+    scheduler.update_state_after_alloc(request, make_blocks(), 32)
+    scheduler.build_connector_meta(MagicMock())
+    request.status = RequestStatus.FINISHED_ABORTED
     scheduler.request_finished(request, ([0],))
+    scheduler.request_finished(request, ([0],))
+    scheduler.update_connector_output(
+        SimpleNamespace(finished_recving=set(), failed_recving=set(), finished_sending=None)
+    )
     assert scheduler._copy_sfa_slot_allocator.bound_slots() == {"cancelled": 0}
     assert not scheduler._copy_sfa_slot_allocator.can_bind("next")
+    assert scheduler._heartbeat_thread.requests == {"cancelled": ("127.0.0.1", 6000, "request-p")}
+    scheduler._recving_thread.add_request.assert_not_called()
     scheduler.update_connector_output(
         SimpleNamespace(
             finished_recving={"cancelled"}, failed_recving={"cancelled"} if failed else set(), finished_sending=None
         )
     )
     assert not scheduler._copy_sfa_deferred_releases
+    assert not scheduler._heartbeat_thread.requests
+    scheduler._recving_thread.add_request.assert_called_once_with("127.0.0.1", 6000, "request-p")
     assert scheduler._copy_sfa_slot_allocator.bind("next") == 0
+
+
+def test_waiting_for_sfa_row_keeps_lease_until_cancelled_before_allocation():
+    scheduler = make_pull_scheduler()
+    scheduler._copy_sfa_slot_allocator = CopySfaTopkSlotAllocator(1)
+    scheduler._copy_sfa_slot_allocator.bind("busy")
+    scheduler._heartbeat_thread = MooncakeHeartbeatThread(5)
+    scheduler._recving_thread = MagicMock()
+    request = heartbeat_request(remote_num_prompt_tokens=32)
+    scheduler.on_new_request(request)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert scheduler._heartbeat_thread.requests == {"request-d": ("127.0.0.1", 6000, "request-p")}
+    assert not scheduler._reqs_recv_info
+    request.status = RequestStatus.FINISHED_ABORTED
+    scheduler.request_finished(request, ())
+    assert not scheduler._heartbeat_thread.requests
+    assert scheduler._copy_sfa_slot_allocator.bound_slots() == {"busy": 0}
+    scheduler._recving_thread.add_request.assert_called_once_with("127.0.0.1", 6000, "request-p")
 
 
 @pytest.mark.parametrize("tokens", [1, 128, 129, 2048, 2049, 2175, 2176, 2177, 2304, 2305, 4096, 4097])
