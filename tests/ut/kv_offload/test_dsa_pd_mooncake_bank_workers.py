@@ -58,6 +58,7 @@ class BankRuntime:
         self.copy = reader.host_kv.manager.copy_sfa_kv
         runtime = self
 
+        # Defer copies until waits so tests can detect premature staging reuse.
         class Stream:
             def __init__(self, index):
                 self.index = index
