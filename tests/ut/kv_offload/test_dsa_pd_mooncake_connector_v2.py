@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_ascend import envs
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import staging as staging_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import transfer_targets as registry_module
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
@@ -311,7 +310,7 @@ def test_read_probe_only_synchronizes_successful_reads_before_landing(monkeypatc
 
     reader.engine.batch_transfer_sync_read.side_effect = read
     reader.host_kv.manager.copy_sfa_kv = lambda *_args: order.append("land")
-    monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
+    monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", "1")
     monkeypatch.setattr(torch.npu, "synchronize", lambda: order.append("probe"))
     info, error = MagicMock(), MagicMock()
     monkeypatch.setattr(staging_module.logger, "info", info)

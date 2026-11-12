@@ -8,8 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_ascend import envs
-
 from .test_dsa_pd_mooncake_connector_v2 import make_reader
 
 
@@ -22,7 +20,7 @@ def test_conflicting_host_ranges_reject_mixed_read_without_writing(monkeypatch, 
     monkeypatch.setattr(torch.npu, "Event", MagicMock())
     monkeypatch.setattr(torch.npu, "Stream", MagicMock())
     monkeypatch.setattr(torch.npu, "synchronize", MagicMock())
-    monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", streams)
+    monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", str(streams))
     reader = make_reader(MagicMock(), pipeline=pipeline, window=4, bank_workers=None)
     host, direct = torch.full((96,), -7, dtype=torch.int8), torch.full((16,), -9, dtype=torch.int8)
     reader.kv_registry.register_offloaded_tensor(host)

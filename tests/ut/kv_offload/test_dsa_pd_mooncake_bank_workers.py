@@ -205,8 +205,8 @@ class BankRuntime:
 
 
 def build(monkeypatch, workers=None, count=37, metadata=True, banks=BANKS, window=WINDOW, copy_streams=1):
-    monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", False)
-    monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", copy_streams)
+    monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", "0")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", str(copy_streams))
     storage = torch.empty(ALIGNMENT + count * PIECE_BYTES + 64, dtype=torch.uint8)
     offset = (-storage.data_ptr()) % ALIGNMENT + 64
     source = storage[offset : offset + count * PIECE_BYTES]
@@ -474,7 +474,7 @@ def test_worker_setting_retains_serial_fallbacks(monkeypatch, reason):
     case.runtime.workers = 0
     case.runtime.barrier = None
     if reason == "probe":
-        monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
+        monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", "1")
     else:
         case.reader._pipeline_landing_enabled = False
     assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
@@ -572,7 +572,7 @@ def test_automatic_workers_retain_serial_fallbacks(monkeypatch, reason):
     case.runtime.workers = 0
     case.runtime.barrier = None
     if reason == "probe":
-        monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
+        monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", "1")
     else:
         case.reader._pipeline_landing_enabled = False
     assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
@@ -588,3 +588,20 @@ def test_removed_worker_environment_cannot_override_automatic_policy(monkeypatch
     assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
     assert case.runtime.peak_reads == BANKS
     case.runtime.assert_drained()
+
+
+@pytest.mark.parametrize(
+    "name,value,expected",
+    [
+        ("VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", "1", True),
+        ("VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", "3", 3),
+    ],
+)
+def test_bank_fixture_preserves_dynamic_environment_access(monkeypatch, name, value, expected):
+    # Module __getattr__ values must remain dynamic after fixture teardown.
+    monkeypatch.delitem(vars(envs), name, raising=False)
+    with monkeypatch.context() as overrides:
+        build(overrides, copy_streams=2)
+    assert name not in vars(envs)
+    monkeypatch.setenv(name, value)
+    assert getattr(envs, name) == expected

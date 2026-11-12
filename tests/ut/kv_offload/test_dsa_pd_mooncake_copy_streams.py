@@ -57,7 +57,7 @@ def test_stream_configuration_changes_only_after_prior_copies_drain(monkeypatch)
     case = build(monkeypatch)
     banks = None
     for streams in (1, 4, 2, 1):
-        monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", streams)
+        monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", str(streams))
         case.source.add_(1)
         assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
         assert_bytes(case)
@@ -108,7 +108,7 @@ def test_disabled_pipeline_and_probe_keep_one_copy_stream(monkeypatch, reason):
     case.runtime.workers = 0
     case.runtime.barrier = None
     if reason == "probe":
-        monkeypatch.setattr(envs, "VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", True)
+        monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE", "1")
     else:
         case.reader._pipeline_landing_enabled = False
     assert case.reader.batch_transfer_sync_read(*case.args, **case.kwargs) == 0
