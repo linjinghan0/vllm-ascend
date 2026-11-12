@@ -8,7 +8,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import Moon
 class TestSharedHostIntegration(TestCase):
     def test_shared_host_ownership_is_applied_before_address_building(self):
         pool = SimpleNamespace(rank=3, size=8, contains=lambda ptr: ptr == 1024)
-        local, remote, lengths = [], [], []
+        local: list[int] = []
+        remote: list[int] = []
+        lengths: list[int] = []
         MooncakePullRecvingThread._append_block_transfer_addresses(
             [list(range(16))],
             [list(range(20, 36))],
@@ -30,7 +32,9 @@ class TestSharedHostIntegration(TestCase):
         pool = SimpleNamespace(rank=1, size=3, contains=lambda ptr: ptr == 1024)
         for local_stride, remote_stride, length in ((256, 512, 64), (128, 256, 128), (256, 128, 128)):
             with self.subTest(local_stride=local_stride, remote_stride=remote_stride, length=length):
-                local, remote, lengths = [], [], []
+                local: list[int] = []
+                remote: list[int] = []
+                lengths: list[int] = []
                 MooncakePullRecvingThread._append_block_transfer_addresses(
                     [list(range(8))],
                     [list(range(20, 28))],
@@ -52,7 +56,9 @@ class TestSharedHostIntegration(TestCase):
 
     def test_rank_without_owned_host_blocks_emits_no_addresses(self):
         pool = SimpleNamespace(rank=7, size=8, contains=lambda ptr: ptr == 1024)
-        local, remote, lengths = [], [], []
+        local: list[int] = []
+        remote: list[int] = []
+        lengths: list[int] = []
         MooncakePullRecvingThread._append_block_transfer_addresses(
             [[1, 2]], [[10, 11]], 1024, 100000, 128, 128, 128, local, remote, lengths, host_kv=pool
         )
@@ -60,7 +66,9 @@ class TestSharedHostIntegration(TestCase):
 
     def test_rank_local_hbm_destinations_keep_the_complete_transfer(self):
         pool = SimpleNamespace(rank=3, size=8, contains=lambda ptr: False)
-        local, remote, lengths = [], [], []
+        local: list[int] = []
+        remote: list[int] = []
+        lengths: list[int] = []
         MooncakePullRecvingThread._append_block_transfer_addresses(
             [list(range(16))],
             [list(range(20, 36))],

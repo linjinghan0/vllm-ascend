@@ -3,9 +3,11 @@
 
 import ctypes
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -41,20 +43,20 @@ class BankRuntime:
         self.window = window
         self.lock = threading.Lock()
         self.local = threading.local()
-        self.threads = set()
+        self.threads: set[threading.Thread] = set()
         self.reads = []
         self.active_reads = 0
         self.peak_reads = 0
-        self.bank_owners = set()
+        self.bank_owners: set[int] = set()
         self.read_hook = None
         self.copy_hook = None
         self.event_hook = None
-        self.events = []
-        self.batch_threads = []
-        self.copy_submissions = []
+        self.events: list[Any] = []
+        self.batch_threads: list[tuple[int, threading.Thread]] = []
+        self.copy_submissions: list[tuple[int, int, int]] = []
         self.wait_hook = None
         self.barrier = threading.Barrier(min(workers, banks, batches)) if workers else None
-        self.queues = [[] for _ in range(banks)]
+        self.queues: list[list[Callable[[], None]]] = [[] for _ in range(banks)]
         self.copy = reader.host_kv.manager.copy_sfa_kv
         runtime = self
 
@@ -76,7 +78,7 @@ class BankRuntime:
 
         class Event:
             def __init__(self):
-                self.tasks = ()
+                self.tasks: tuple[Callable[[], None], ...] = ()
                 self.records = 0
                 self.waits = 0
                 runtime.events.append(self)

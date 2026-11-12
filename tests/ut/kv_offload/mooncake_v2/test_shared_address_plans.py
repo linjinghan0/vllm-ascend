@@ -71,7 +71,10 @@ def test_shared_plans_preserve_addresses_and_targets_across_layers(rank, layout,
     owned_b = [[(6, 26)], [(8, 28)], [], []][rank]
     host_bases = {base for layer in local_bases[:2] for base in layer}
     pool = SimpleNamespace(rank=rank, size=4, contains=lambda ptr: ptr in host_bases)
-    src, dst, lengths, actual_targets = [], [], [], []
+    src: list[int] = []
+    dst: list[int] = []
+    lengths: list[int] = []
+    actual_targets: list[object] = []
     thread._sfa_host_kv = pool
     with (
         patch.object(
@@ -98,7 +101,7 @@ def test_shared_plans_preserve_addresses_and_targets_across_layers(rank, layout,
     modes = 2 if layout == "mixed" and not partial_heads else 1
     assert partition.call_count == 2 * modes  # requests × modes, independent of layers/components
     assert group.call_count == (0 if layout == "strided" or partial_heads else 2)
-    expected = []
+    expected: list[tuple[int, int, object | None]] = []
     for layer in range(3):
         for component in range(2):
             for request, local_ids, remote_ids in entries:
@@ -143,7 +146,9 @@ def test_shared_plan_is_rebuilt_for_changed_request_mapping_and_tp_owner():
             (1, [4, 5], [24, 25], (5, 25)),
         ]:
             pool.rank = rank
-            src, dst, lengths = [], [], []
+            src: list[int] = []
+            dst: list[int] = []
+            lengths: list[int] = []
             entries = [("same-request", local_ids, remote_ids)]
             thread._append_spec_transfer_addresses(
                 0, 0, 0, 1, 1, 1, {(0, 0): entries, (1, 1): entries}, remote, src, dst, lengths
@@ -204,7 +209,10 @@ def test_host_ownership_uses_raw_pairs_and_bound_target_classification(rank, coa
     pool = SimpleNamespace(rank=rank, size=8, contains=lambda ptr: offloaded)
     thread._sfa_host_kv = pool
     entries = [("r", [3, 1, 2, 3, 9], [13, 11, 12, 33, 19])]
-    src, dst, lengths, actual_targets = [], [], [], []
+    src: list[int] = []
+    dst: list[int] = []
+    lengths: list[int] = []
+    actual_targets: list[object] = []
     with (
         patch.object(pool, "contains", wraps=pool.contains) as contains,
         patch.object(
@@ -236,7 +244,7 @@ def test_host_ownership_uses_raw_pairs_and_bound_target_classification(rank, coa
         pairs = {0: [(1, 11)], 2: [(3, 13), (3, 33)], 7: []}[rank]
     else:
         pairs = [(3, 13), (1, 11), (2, 12), (3, 33), (9, 19)]
-    expected = []
+    expected: list[tuple[int, int, object | None]] = []
     for layer in range(3):
         for component in range(2):
             for local, peer in pairs:

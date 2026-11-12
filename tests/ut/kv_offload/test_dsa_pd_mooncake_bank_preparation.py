@@ -5,7 +5,9 @@ import ctypes
 import gc
 import threading
 import weakref
+from collections.abc import Callable
 from contextlib import contextmanager
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,9 +37,9 @@ class DelayedLanding:
         self.reader = reader
         self.original_copy = reader.host_kv.manager.copy_sfa_kv
         self.current = None
-        self.pending = {id(stream): [] for stream in reader._landing_streams}
-        self.events = []
-        self.copy_banks = []
+        self.pending: dict[int, list[Callable[[], None]]] = {id(stream): [] for stream in reader._landing_streams}
+        self.events: list[Any] = []
+        self.copy_banks: list[Any] = []
         self.caller = threading.get_ident()
         runtime = self
 
@@ -322,13 +324,19 @@ def test_bank_failure_drains_submitted_bytes_before_unlock(monkeypatch, failure)
     elif failure == "event_record":
         event_type = torch.npu.Event
 
-        class BrokenEvent(event_type):
-            def record(self, stream):
+        def make_broken_event():
+            event = event_type()
+            original_record = event.record
+
+            def record(stream):
                 if reads == 2:
                     raise RuntimeError("event failed")
-                super().record(stream)
+                original_record(stream)
 
-        monkeypatch.setattr(torch.npu, "Event", BrokenEvent)
+            event.record = record
+            return event
+
+        monkeypatch.setattr(torch.npu, "Event", make_broken_event)
     args = ("peer", [host.data_ptr()], [source.data_ptr()], [host.numel()], "request")
     if failure == "negative":
         assert reader.batch_transfer_sync_read(*args) == -7

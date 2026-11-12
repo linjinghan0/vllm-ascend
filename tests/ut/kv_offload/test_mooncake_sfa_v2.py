@@ -23,6 +23,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import (
     MooncakePullRecvingThread,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import DSAPDMooncakeTransferTarget
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import CopySfaTailDest
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.scheduler import SFAPDRD2HScheduler
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import sparse_kv_offload_manager as manager_module
@@ -196,9 +197,11 @@ def test_main_blocks_are_partitioned_once_while_indexer_stays_replicated(tp_size
         host = MooncakeSFAHostKV(manager, caches)
         thread = MooncakePullRecvingThread.__new__(MooncakePullRecvingThread)
         thread._sfa_host_kv = host
-        ownership = {}
+        ownership: dict[tuple[int, int, bool], tuple[list[list[int]], list[list[int]]]] = {}
         for tensor in host.transfer_caches[MAIN]:
-            src, dst, lengths = [], [], []
+            src: list[int] = []
+            dst: list[int] = []
+            lengths: list[int] = []
             thread._append_block_transfer_addresses(
                 local_block_groups=[[0, 1, 2, 3]],
                 remote_block_groups=[[4, 5, 6, 7]],
@@ -215,7 +218,9 @@ def test_main_blocks_are_partitioned_once_while_indexer_stays_replicated(tp_size
             )
             all_main.append(sum(lengths))
         assert len(ownership) == 1
-        src, dst, lengths = [], [], []
+        src = []
+        dst = []
+        lengths = []
         thread._append_block_transfer_addresses(
             local_block_groups=[[0, 1, 2, 3]],
             remote_block_groups=[[4, 5, 6, 7]],
@@ -249,7 +254,7 @@ def test_real_bytes_land_through_manager_with_existing_pipeline(monkeypatch, pip
     reader = MooncakeSFAStagingReader(engine, host, [[128 * 8192 * 2], [128 * 4]])
     tensors = [*host.transfer_caches[MAIN], *host.transfer_caches[INDEXER]]
     sources = [torch.full((tensor.nbytes,), i + 1, dtype=torch.int8) for i, tensor in enumerate(tensors)]
-    reads = []
+    reads: list[tuple[int, int]] = []
 
     def read(_session, local, remote, lengths):
         reads.extend(zip(remote, lengths))
@@ -270,6 +275,7 @@ def test_real_bytes_land_through_manager_with_existing_pipeline(monkeypatch, pip
         table = reader.get_transfer_targets(
             [MAIN, INDEXER], [[t.data_ptr() for t in host.transfer_caches[n]] for n in [MAIN, INDEXER]]
         )
+        assert table is not None
         kwargs["transfer_targets"] = [*table[0], *table[1]]
     assert (
         reader.batch_transfer_sync_read(
@@ -423,7 +429,10 @@ def test_direct_hbm_reads_match_unchanged_sfa_dense_and_circular_tail(tokens, tp
             remote_num_prompt_tokens=tokens,
             remote_block_ids=([], blocks),
         )
-        local, peer, lengths, targets = [], [], [], []
+        local: list[int] = []
+        peer: list[int] = []
+        lengths: list[int] = []
+        targets: list[DSAPDMooncakeTransferTarget] = []
         host.append_prefill_reads(MAIN, request, (1000, 2000), (1024, 512), (1024, 512), local, peer, lengths, targets)
         thread = _make_tail_read_thread(tp_rank=rank, tp_size=tp_size)
         dense, tail_tokens, tail_block = copy_sfa_prefill_dest_geometry(tokens, 128, 2048)
@@ -459,7 +468,7 @@ def test_real_bucket_direct_hbm_and_host_landing_share_completion(tokens, pipeli
     reader.block_len_per_addr = [[1024, 512]]
     source_k = torch.arange(40 * 128 * 4, dtype=torch.float32).to(torch.bfloat16).reshape(40, 128, 1, 4)
     source_v = torch.arange(40 * 128 * 2, dtype=torch.float32).neg().to(torch.bfloat16).reshape(40, 128, 1, 2)
-    reads = []
+    reads: list[tuple[int, int, int]] = []
 
     def read(_session, local, remote, lengths):
         reads.extend(zip(local, remote, lengths))
@@ -553,7 +562,9 @@ def test_partial_local_prefix_still_primes_whole_dense_row_from_producer():
         remote_num_prompt_tokens=201,
         remote_block_ids=([], [5, 9]),
     )
-    local, peer, lengths = [], [], []
+    local: list[int] = []
+    peer: list[int] = []
+    lengths: list[int] = []
     host.append_prefill_reads(MAIN, req, (1000, 2000), (1024, 512), (1024, 512), local, peer, lengths)
     assert peer[0] == 1000 + 5 * 1024
     assert sum(lengths) == 201 * 12

@@ -638,8 +638,8 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             if self._heartbeat_thread is not None:
                 self._heartbeat_thread.remove_request(req_id)
             remote = self._reqs_recv_info.pop(req_id, None)
-            deferred = getattr(self, "_copy_sfa_deferred_releases", ())
-            if req_id in deferred:
+            deferred: set[str] | None = getattr(self, "_copy_sfa_deferred_releases", None)
+            if deferred is not None and req_id in deferred:
                 assert self._copy_sfa_slot_allocator is not None
                 self._copy_sfa_slot_allocator.release(req_id)
                 deferred.remove(req_id)

@@ -207,8 +207,10 @@ class TestDSAPDMooncakeRegistryRanges(TestCase):
         del tensor
         # Exercise deaths after lookup metadata has already been initialized.
         self.registry.resolve_offloaded_tensor(100, 1)
-        for position in range(0, len(tensors), 3):
-            tensors[position] = None
+        retained_tensors: list[_TensorStub | None] = list(tensors)
+        del tensors
+        for position in range(0, len(retained_tensors), 3):
+            retained_tensors[position] = None
         gc.collect()
         for _ in range(2000):
             ptr = rng.randrange(-10, 3500)
@@ -217,9 +219,9 @@ class TestDSAPDMooncakeRegistryRanges(TestCase):
             self.assertEqual(self.registry.get_register_location(ptr, size), "cpu" if expected_cpu else None)
             expected = None
             for (start, length), tensor_ref in zip(ranges, tensor_refs):
-                tensor = tensor_ref()
-                if tensor is not None and start <= ptr and ptr + size <= start + length:
-                    expected = (tensor, ptr - start)
+                resolved_tensor = tensor_ref()
+                if resolved_tensor is not None and start <= ptr and ptr + size <= start + length:
+                    expected = (resolved_tensor, ptr - start)
                     break
             actual = self.registry.resolve_offloaded_tensor(ptr, size)
             if expected is None:

@@ -3,7 +3,7 @@
 
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
@@ -220,7 +220,7 @@ class MooncakeSFAStagingReader:
         staging_ptr = int(staging.data_ptr())
         staging_alignment = 2 * 1024 * 1024
         bank_window = banks[0].slot_count
-        batches = []
+        batches: list[_DSAPDMooncakeBankBatch] = []
         intervals = []
         transfers = iter(staged_transfers)
         # A Host range can continue in another batch without materializing its pieces.
@@ -229,7 +229,10 @@ class MooncakeSFAStagingReader:
         while True:
             bank_index = len(batches) % len(banks)
             bank = banks[bank_index]
-            local_staging_ptrs, remote_src_ptrs, transfer_lengths, copy_plan = [], [], [], []
+            local_staging_ptrs: list[int] = []
+            remote_src_ptrs: list[int] = []
+            transfer_lengths: list[int] = []
+            copy_plan: list[tuple[int, int, int, torch.Tensor, int]] = []
             for position in range(bank_window):
                 while remaining == 0:
                     transfer = next(transfers, None)
@@ -439,7 +442,7 @@ class MooncakeSFAStagingReader:
             list[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]],
             tuple[int, BaseException] | None,
         ]:
-            results = []
+            results: list[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]] = []
             for batch in batches:
                 if stopped.is_set():
                     break
@@ -637,6 +640,7 @@ class MooncakeSFAStagingReader:
                     return ret
             if pipeline_active and not ascend_envs.VLLM_ASCEND_DSA_PD_MOONCAKE_READ_PROBE:
                 workers = self._get_dsa_pd_mooncake_bank_workers(bank_contexts)
+            batch_results: Iterable[tuple[_DSAPDMooncakeBankBatch, _DSAPDMooncakeBankBatchResult]]
             if workers:
                 batch_results = self._execute_dsa_pd_mooncake_bank_workers(
                     session_id, plan, bank_contexts, staging, remote_request_id, workers

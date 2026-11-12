@@ -21,6 +21,7 @@ def test_address_paths_preserve_order_and_existing_output(groups, carry_targets)
     assert dst == [22] + [2000 + group[0] * 256 + 9 for group in remote]
     assert lengths == [33] + [64 * len(group) for group in local]
     if carry_targets:
+        assert targets is not None
         assert len(targets) == groups + 1 and all(target is marker for target in targets)
 
 
@@ -28,7 +29,9 @@ def test_address_paths_preserve_order_and_existing_output(groups, carry_targets)
 def test_addresses_keep_python_integer_precision_and_signed_offsets(groups):
     base = (1 << 64) + 10
     local, remote = [[i + 1] for i in range(groups)], [[i + 2] for i in range(groups)]
-    src, dst, lengths = [], [], []
+    src: list[int] = []
+    dst: list[int] = []
+    lengths: list[int] = []
     MooncakePullRecvingThread._append_block_transfer_addresses(
         local, remote, base, base + 3, 7, 11, 5, src, dst, lengths, -9, -13
     )
@@ -41,7 +44,9 @@ def test_addresses_keep_python_integer_precision_and_signed_offsets(groups):
 @pytest.mark.parametrize("counts", [(1, 0), (0, 1), (33, 32), (32, 33)])
 def test_mismatched_group_counts_keep_zip_truncation(counts):
     local, remote = [[i] for i in range(counts[0])], [[i] for i in range(counts[1])]
-    src, dst, lengths = [], [], []
+    src: list[int] = []
+    dst: list[int] = []
+    lengths: list[int] = []
     MooncakePullRecvingThread._append_block_transfer_addresses(local, remote, 10, 20, 3, 5, 7, src, dst, lengths)
     count = min(counts)
     assert src == [10 + 3 * i for i in range(count)]
@@ -51,6 +56,8 @@ def test_mismatched_group_counts_keep_zip_truncation(counts):
 
 @pytest.mark.parametrize("length", [0, -1])
 def test_nonpositive_transfer_length_does_not_append(length):
-    src, dst, sizes = [], [], []
+    src: list[int] = []
+    dst: list[int] = []
+    sizes: list[int] = []
     MooncakePullRecvingThread._append_block_transfer_addresses([[0]], [[0]], 10, 20, 3, 5, length, src, dst, sizes)
     assert not src and not dst and not sizes

@@ -5,6 +5,7 @@ import ctypes
 import threading
 import weakref
 from contextlib import nullcontext
+from typing import TypedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,6 +22,13 @@ class StopWorkerLoop(Exception):
     pass
 
 
+class PendingReceiveState(TypedDict):
+    pending: bool
+    wait_fails: bool
+    waits: int
+    descriptors: list[weakref.ReferenceType[torch.Tensor]]
+
+
 def pending_receive(monkeypatch, *, pipeline, land_raises):
     monkeypatch.setenv("VLLM_ASCEND_DSA_PD_MOONCAKE_COPY_STREAMS_PER_BANK", "1")
     monkeypatch.setattr(torch.npu, "stream", lambda _stream: nullcontext())
@@ -30,7 +38,7 @@ def pending_receive(monkeypatch, *, pipeline, land_raises):
     destination = torch.zeros(64, dtype=torch.int8)
     source = torch.arange(64, dtype=torch.int8)
     reader.kv_registry.register_offloaded_tensor(destination)
-    state = {"pending": False, "wait_fails": True, "waits": 0, "descriptors": []}
+    state: PendingReceiveState = {"pending": False, "wait_fails": True, "waits": 0, "descriptors": []}
 
     def read(_session, local, remote, lengths):
         assert not state["pending"], "Reused staging before the previous copy stopped"

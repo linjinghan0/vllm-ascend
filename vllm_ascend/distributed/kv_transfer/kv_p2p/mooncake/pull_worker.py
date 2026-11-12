@@ -1115,6 +1115,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                 prepared = {}
                 for request_id, (local_block_ids, remote_block_ids) in block_ids_by_request.items():
                     if shared_host:
+                        assert host_kv is not None
                         # Ownership already sorts and coalesces the original pairs;
                         # grouping them before that only creates work to undo.
                         groups = partition_shared_block_groups(
@@ -1170,9 +1171,10 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                         )
                     if local_block_len <= 0:
                         continue
-                    local_target = (
-                        self._transfer_targets[local_layer_index][cache_index] if transfer_targets is not None else None
-                    )
+                    local_target = None
+                    if transfer_targets is not None:
+                        assert self._transfer_targets is not None
+                        local_target = self._transfer_targets[local_layer_index][cache_index]
                     block_ids_to_transfer = get_block_groups(
                         local_block_stride == remote_block_stride == local_block_len, local_base_addr, local_target
                     )
@@ -1189,14 +1191,8 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                             local_destinations=local_destinations,
                             remote_sources=remote_sources,
                             lengths=lengths,
-                            **(
-                                {
-                                    "transfer_targets": transfer_targets,
-                                    "local_target": local_target,
-                                }
-                                if transfer_targets is not None
-                                else {}
-                            ),
+                            transfer_targets=transfer_targets,
+                            local_target=local_target,
                         )
             return
 
@@ -1305,9 +1301,10 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                     continue
                 local_inner_offset = local_head_offset * local_head_len
                 remote_inner_offset = remote_head_offset * remote_head_len
-                local_target = (
-                    self._transfer_targets[local_layer_index][cache_index] if transfer_targets is not None else None
-                )
+                local_target = None
+                if transfer_targets is not None:
+                    assert self._transfer_targets is not None
+                    local_target = self._transfer_targets[local_layer_index][cache_index]
                 block_ids_to_transfer = get_block_groups(
                     local_block_stride == local_block_len == transfer_len
                     and remote_block_stride == remote_block_len == transfer_len,
@@ -1329,14 +1326,8 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                         local_destinations=local_destinations,
                         remote_sources=remote_sources,
                         lengths=lengths,
-                        **(
-                            {
-                                "transfer_targets": transfer_targets,
-                                "local_target": local_target,
-                            }
-                            if transfer_targets is not None
-                            else {}
-                        ),
+                        transfer_targets=transfer_targets,
+                        local_target=local_target,
                     )
 
     def _execute_tp_transfer_bucket(
@@ -1365,7 +1356,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         lengths: list[int] = []
         # Preserve local target identities alongside the computed addresses.
         # Mamba's distinct state-copy layout keeps its existing generic path.
-        transfer_targets = (
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = (
             []
             if self.staging_reader is not None
             and getattr(self, "_transfer_targets", None) is not None
@@ -1385,7 +1376,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                 local_destinations=local_destinations,
                 remote_sources=remote_sources,
                 lengths=lengths,
-                **({"transfer_targets": transfer_targets} if transfer_targets is not None else {}),
+                transfer_targets=transfer_targets,
             )
 
         if not local_destinations and sfa_requests is None:
@@ -1635,12 +1626,10 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
         if self.kv_transfer_config.is_kv_consumer:
             assert self._recving_thread is not None
             request_groups: dict[str, dict[str, ReqMeta]] = {}
+            state = getattr(self, "_sfa_pd_state", None)
             for request_id, request_metadata in metadata.requests.items():
                 requests = request_groups.setdefault(request_metadata.remote_engine_id, {})
-                if (
-                    getattr(self, "_sfa_pd_state", None) is not None
-                    and request_metadata.copy_sfa_slot != self._sfa_pd_state.bindings[request_id]
-                ):
+                if state is not None and request_metadata.copy_sfa_slot != state.bindings[request_id]:
                     raise ValueError("Mooncake V2 SFA PD transfer differs from its reserved hot row")
                 requests[request_id] = request_metadata
 

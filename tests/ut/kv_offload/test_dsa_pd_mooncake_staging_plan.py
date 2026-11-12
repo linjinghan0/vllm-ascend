@@ -45,7 +45,7 @@ def test_partial_first_slot_and_aligned_tails_preserve_mixed_landing(chunk_units
     reader._dsa_pd_mooncake_staging_bytes = 4 * chunk
     staging_ptr = reader._dsa_pd_mooncake_staging_tensor.data_ptr()
     remote_base = 8 * ALIGNMENT + page_offset
-    pieces = []
+    pieces: list[tuple[int, int, int]] = []
     direct_reads = []
 
     def read(_session, local, remote, lengths):
