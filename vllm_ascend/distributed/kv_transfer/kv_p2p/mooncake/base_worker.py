@@ -506,6 +506,18 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
         """Register configured KV cache allocations and publish metadata."""
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
+        self._sfa_host_kv = None
+        sparse_cfg = getattr(self.ascend_config, "sparse_kv_offload_config", None)
+        if sparse_cfg is not None and sparse_cfg.enabled and self.kv_transfer_config.is_kv_consumer:
+            # MRV2 has already registered the manager before connector setup.
+            # Only persistent Host main KV and device indexer views go on wire.
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import MooncakeSFAHostKV
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
+                get_sparse_kv_offload_manager,
+            )
+
+            self._sfa_host_kv = MooncakeSFAHostKV(get_sparse_kv_offload_manager(), kv_caches)
+            kv_caches = self._sfa_host_kv.transfer_caches
         self.kv_caches = kv_caches
         self._build_kv_cache_spec_mappings()
         owners = (
@@ -613,7 +625,17 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
 
         register_regions = collect_configured_register_regions(self.kv_cache_config, kv_caches)
         validate_register_region_count(register_regions)
-        global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        # Manager-owned Host KV is not an HBM READ destination. Keep its
+        # addresses in metadata, but register only device storage with the transfer engine.
+        device_regions = [
+            (ptr, length)
+            for ptr, length in zip(register_regions.ptrs, register_regions.lengths)
+            if self._sfa_host_kv is None or self._sfa_host_kv.registry.get_register_location(ptr, length) != "cpu"
+        ]
+        if self._sfa_host_kv is not None:
+            device_regions = list(dict.fromkeys([*device_regions, *self._sfa_host_kv.device_register_regions()]))
+        if device_regions:
+            global_te.register_buffer([ptr for ptr, _ in device_regions], [length for _, length in device_regions])
 
         transfer_metadata = MooncakeTransferMetadata(
             engine_id=self.engine_id,
@@ -642,8 +664,8 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
             self.engine_id,
             len(layer_names),
             self.num_blocks,
-            len(register_regions.ptrs),
-            sum(register_regions.lengths),
+            len(device_regions),
+            sum(length for _, length in device_regions),
         )
 
         logger.debug(
