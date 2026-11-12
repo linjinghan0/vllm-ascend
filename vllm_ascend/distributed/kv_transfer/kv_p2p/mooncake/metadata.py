@@ -151,6 +151,7 @@ class ReqMeta:
     remote_request_id: str
     remote_num_prompt_tokens: int
     local_full_block_ids: BlockIds
+    copy_sfa_slot: int | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +200,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.push_failed_requests: dict[str, bool] = {}
         self.requests_to_send: dict[str, float] = {}
         self.reqs_in_batch: set[str] = set()
+        # Scheduler-to-worker only; never included in the cross-host handshake.
+        self.copy_sfa_slots: dict[str, int] = {}
 
     def add_new_req(
         self,
@@ -208,6 +211,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         num_external_tokens: int,
         kv_transfer_params: dict[str, Any],
         local_full_block_ids: BlockIds | None = None,
+        copy_sfa_slot: int | None = None,
     ) -> None:
         self.requests[request_id] = ReqMeta(
             local_block_ids=local_block_ids,
@@ -221,6 +225,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_request_id=kv_transfer_params["remote_request_id"],
             remote_num_prompt_tokens=kv_transfer_params["remote_num_prompt_tokens"],
             local_full_block_ids=local_full_block_ids or tuple(),
+            copy_sfa_slot=copy_sfa_slot,
         )
 
     def add_new_push_req(

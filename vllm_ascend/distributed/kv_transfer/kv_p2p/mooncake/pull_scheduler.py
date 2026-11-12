@@ -339,6 +339,19 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if type(self._kv_lease_duration) is not int or self._kv_lease_duration < 6:
             raise ValueError("Mooncake kv_lease_duration must be an integer of at least 6 seconds")
 
+        self._copy_sfa_slot_allocator = None
+        self._copy_sfa_deferred_releases: set[str] = set()
+        sparse_cfg = getattr(self.ascend_config, "sparse_kv_offload_config", None)
+        if self.kv_transfer_config.is_kv_consumer and sparse_cfg is not None and sparse_cfg.use_fused_copy_sfa:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import (
+                CopySfaTopkSlotAllocator,
+                copy_sfa_pool_capacity,
+            )
+
+            self._copy_sfa_slot_allocator = CopySfaTopkSlotAllocator(
+                copy_sfa_pool_capacity(vllm_config.scheduler_config.max_num_seqs)
+            )
+
         if self.kv_transfer_config.is_kv_consumer:
             recving_ready_event = threading.Event()
             self._recving_thread = MooncakeSchedulerRecvingThread(recving_ready_event)
@@ -426,6 +439,24 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if not self._sending_thread.is_alive():
             raise RuntimeError("Mooncake scheduler sending thread failed to start")
 
+    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int | None, bool]:
+        """Check SFA row capacity before accepting remote prompt tokens."""
+        params = request.kv_transfer_params
+        if params is not None and params.get("do_remote_prefill"):
+            allocator = getattr(self, "_copy_sfa_slot_allocator", None)
+            token_ids = request.prompt_token_ids or []
+            remote_prompt_tokens = params.get("remote_num_prompt_tokens")
+            if allocator is not None and remote_prompt_tokens is not None and len(token_ids) != remote_prompt_tokens:
+                raise ValueError(
+                    "Mooncake V2 Sparse KV offload requires the same original prompt on P and D; "
+                    "appending the producer's first output token is not supported."
+                )
+            if allocator is not None and not allocator.can_bind(request.request_id):
+                # Waiting async receivers do not count towards max_num_seqs.
+                # Defer before KV allocation, matching SFA's row admission.
+                return None, False
+        return super().get_num_new_matched_tokens(request, num_computed_tokens)
+
     def update_state_after_alloc(
         self,
         request: "Request",
@@ -454,6 +485,9 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                 "remote_request_id",
             )
             if all(field in params for field in required_remote_fields):
+                allocator = getattr(self, "_copy_sfa_slot_allocator", None)
+                if allocator is not None:
+                    allocator.bind(request.request_id)
                 remote = (
                     params["remote_host"],
                     params["remote_port"],
@@ -483,6 +517,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata()
+        allocator = getattr(self, "_copy_sfa_slot_allocator", None)
 
         for (
             req_id,
@@ -496,11 +531,15 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                 local_num_prompt_tokens=req.num_prompt_tokens,
                 num_external_tokens=num_external_tokens,
                 kv_transfer_params=req.kv_transfer_params,
+                **({"copy_sfa_slot": allocator.get(req_id)} if allocator is not None else {}),
             )
 
         self._reqs_need_recv.clear()
         meta.reqs_in_batch = self._reqs_in_batch
         self._reqs_in_batch = set()
+        allocator = getattr(self, "_copy_sfa_slot_allocator", None)
+        if allocator is not None:
+            meta.copy_sfa_slots = allocator.bound_slots()
         return meta
 
     def request_finished(
@@ -509,6 +548,17 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         block_ids: BlockIds,
     ) -> tuple[bool, dict[str, Any] | None]:
         """Release unstarted consumer transfers or expose completed producer blocks."""
+        allocator = getattr(self, "_copy_sfa_slot_allocator", None)
+        if allocator is not None:
+            if request.request_id in self._reqs_recv_info:
+                # An aborted async PD may still write this rank-private row.
+                # Reuse it only after completion from every D worker.
+                deferred = getattr(self, "_copy_sfa_deferred_releases", None)
+                if deferred is None:
+                    deferred = self._copy_sfa_deferred_releases = set()
+                deferred.add(request.request_id)
+            else:
+                allocator.release(request.request_id)
         params = request.kv_transfer_params
         # Keep renewing in-flight READs even after client cancellation. Their
         # workers must finish before P can release the source blocks.
@@ -588,6 +638,11 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             if self._heartbeat_thread is not None:
                 self._heartbeat_thread.remove_request(req_id)
             remote = self._reqs_recv_info.pop(req_id, None)
+            deferred: set[str] | None = getattr(self, "_copy_sfa_deferred_releases", None)
+            if deferred is not None and req_id in deferred:
+                assert self._copy_sfa_slot_allocator is not None
+                self._copy_sfa_slot_allocator.release(req_id)
+                deferred.remove(req_id)
             if remote is not None:
                 if self._recving_thread is None:
                     raise RuntimeError("Producer Mooncake scheduler received a receive-completion event")

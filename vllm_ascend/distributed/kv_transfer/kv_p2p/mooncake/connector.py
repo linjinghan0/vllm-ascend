@@ -256,6 +256,19 @@ class MooncakePullConnector(MooncakeBaseConnector):
         else:
             raise ValueError(f"Unsupported KVConnectorRole: {role}")
 
+    def get_copy_sfa_slot_bindings(self) -> dict[str, int]:
+        """Use the same prebound-row contract as the SFA runner path."""
+        state = self.get_copy_sfa_pd_state()
+        return dict(state.bindings) if state is not None else {}
+
+    def get_copy_sfa_pd_state(self):
+        return getattr(self.connector_worker, "_sfa_pd_state", None)
+
+    def prepare_sparse_kv_offload(self, metadata: MooncakeConnectorMetadata) -> None:
+        if self.connector_worker is not None:
+            assert isinstance(self.connector_worker, MooncakePullConnectorWorker)
+            self.connector_worker.prepare_sparse_kv_offload(metadata)
+
 
 class MooncakePushConnector(MooncakeBaseConnector):
     """Layerwise Push facade with role-specific initialization."""

@@ -33,6 +33,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
     MooncakeTransferAddressMixin,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.host_partition import partition_shared_block_groups
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakePPTransferMetadata,
@@ -40,6 +41,8 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadataGroups,
     ReqMeta,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.staging import MooncakeSFAStagingReader
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.transfer_targets import DSAPDMooncakeTransferTarget
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     SizedDict,
     ensure_zmq_recv,
@@ -47,6 +50,28 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     group_concurrent_contiguous,
     zmq_ctx,
 )
+
+_BULK_TRANSFER_ADDRESS_GROUPS = 32
+_STAGING_DRAIN_RETRY_INTERVAL_SECONDS = 10
+
+
+def _build_block_transfer_addresses(
+    local_block_groups: list[list[int]],
+    remote_block_groups: list[list[int]],
+    local_base_addr: int,
+    remote_base_addr: int,
+    local_block_stride: int,
+    remote_block_stride: int,
+    transfer_len: int,
+    local_inner_offset: int,
+    remote_inner_offset: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Build fragmented address columns without closure setup on scalar calls."""
+    return (
+        [local_base_addr + group[0] * local_block_stride + local_inner_offset for group in local_block_groups],
+        [remote_base_addr + group[0] * remote_block_stride + remote_inner_offset for group in remote_block_groups],
+        [transfer_len * len(group) for group in local_block_groups],
+    )
 
 
 class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
@@ -78,9 +103,11 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         dcp_size: int,
         device: Any,
         ready_event: threading.Event,
+        staging_reader: MooncakeSFAStagingReader | None = None,
     ) -> None:
         super().__init__(daemon=True, name="MooncakePullRecvingThread")
         self.engine = engine
+        self.staging_reader = staging_reader
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.kv_cache_config = kv_cache_config
@@ -99,6 +126,12 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         self.block_lens = local_metadata.block_lens
         self.block_shapes = local_metadata.block_shapes
         self.block_size_scales = local_metadata.block_size_scales
+        self._transfer_targets = (
+            staging_reader.get_transfer_targets(self.layer_names, self.kv_caches_base_addr)
+            if staging_reader is not None
+            else None
+        )
+        self._sfa_host_kv = staging_reader.host_kv if staging_reader is not None else None
 
         self.use_mla = self.model_config.is_deepseek_mla
         hf_text_config = self.model_config.hf_text_config
@@ -187,13 +220,8 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                     remote_port,
                     requests,
                 )
-                for request_id in failed_request_ids:
-                    self._mark_request_failed(requests[request_id])
             except Exception as exc:
                 failed_request_ids = set(requests)
-                if self.can_report_invalid_block_ids:
-                    for request_metadata in requests.values():
-                        self._mark_request_failed(request_metadata)
                 logger.exception(
                     "Mooncake pull failed for remote engine %s at %s, marking batch requests failed: %s; error=%s",
                     remote_engine_id,
@@ -202,9 +230,29 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                     exc,
                 )
             finally:
+                # Completion permits the scheduler to recycle Host blocks and
+                # hot rows, including on failure or cancellation. A failed NPU
+                # wait does not prove the submitted copies have stopped.
+                self._wait_for_pending_landing()
+                for request_id in failed_request_ids:
+                    self._mark_request_failed(requests[request_id])
                 for request_id in requests:
                     self.finished_requests.put((request_id, request_id in failed_request_ids))
                 self.request_queue.task_done()
+
+    def _wait_for_pending_landing(self) -> None:
+        if self.staging_reader is None:
+            return
+        while True:
+            try:
+                self.staging_reader.drain_pending_landing()
+                return
+            except Exception:
+                logger.exception(
+                    "Mooncake Host landing drain failed; retaining request resources and retrying in %s seconds",
+                    _STAGING_DRAIN_RETRY_INTERVAL_SECONDS,
+                )
+                time.sleep(_STAGING_DRAIN_RETRY_INTERVAL_SECONDS)
 
     def _mark_request_failed(self, request_metadata: ReqMeta) -> None:
         if not self.can_report_invalid_block_ids:
@@ -537,6 +585,9 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
     ) -> set[str]:
         """Build and execute transfer buckets for one producer engine."""
         remote_metadata = self._get_remote_metadata(remote_engine_id, remote_host, remote_port)
+        if getattr(self, "_sfa_host_kv", None) is not None and hasattr(self._sfa_host_kv, "append_prefill_reads"):
+            if remote_metadata.pcp_size != 1 or remote_metadata.dcp_size != 1:
+                raise ValueError("Mooncake V2 SFA PD hot/tail reads require a producer without context parallelism")
         tp_rank_groups_by_pp_rank = self.remote_tp_rank_groups[remote_engine_id]
         layer_pairs_by_pp_rank = self.remote_layer_index_pairs[remote_engine_id]
         # Cache block mappings for this producer-engine batch:
@@ -581,6 +632,11 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                         remote_metadata.dcp_size,
                         pp_metadata,
                         transfer_entries_by_spec,
+                        **(
+                            {"sfa_requests": requests}
+                            if hasattr(getattr(self, "_sfa_host_kv", None), "append_prefill_reads")
+                            else {}
+                        ),
                     )
                     future_to_task[future] = (
                         remote_pp_rank,
@@ -921,19 +977,75 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         local_block_stride: int,
         remote_block_stride: int,
         transfer_len: int,
-        src_list: list[int],
-        dst_list: list[int],
-        length_list: list[int],
+        local_destinations: list[int],
+        remote_sources: list[int],
+        lengths: list[int],
         local_inner_offset: int = 0,
         remote_inner_offset: int = 0,
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = None,
+        local_target: DSAPDMooncakeTransferTarget | None = None,
+        shared_block_groups: dict[tuple[int, int, bool], tuple[list[list[int]], list[list[int]]]] | None = None,
+        host_kv: Any = None,
     ) -> None:
-        """Append addresses from block groups prepared for one request."""
+        """Append addresses, optionally reusing this request's TP ownership plan."""
         if transfer_len <= 0:
             return
+        if host_kv is not None and host_kv.contains(local_base_addr):
+            coalesce = local_block_stride == remote_block_stride == transfer_len
+            key = (host_kv.rank, host_kv.size, coalesce)
+            prepared = shared_block_groups.get(key) if shared_block_groups is not None else None
+            if prepared is None:
+                prepared = partition_shared_block_groups(
+                    local_block_groups,
+                    remote_block_groups,
+                    host_kv.rank,
+                    host_kv.size,
+                    coalesce=coalesce,
+                )
+                if shared_block_groups is not None:
+                    shared_block_groups[key] = prepared
+            local_block_groups, remote_block_groups = prepared
+            if not local_block_groups:
+                return
+        group_count = len(local_block_groups)
+        if group_count == 1 and len(remote_block_groups) == 1:
+            local_block_group, remote_block_group = local_block_groups[0], remote_block_groups[0]
+            local_destinations.append(local_base_addr + local_block_group[0] * local_block_stride + local_inner_offset)
+            remote_sources.append(remote_base_addr + remote_block_group[0] * remote_block_stride + remote_inner_offset)
+            lengths.append(transfer_len * len(local_block_group))
+            if transfer_targets is not None:
+                assert local_target is not None
+                transfer_targets.append(local_target)
+            return
+        if group_count >= _BULK_TRANSFER_ADDRESS_GROUPS and group_count == len(remote_block_groups):
+            # Keep Python integers and list-based native binding inputs.
+            # Short lists stay scalar; fragmented requests amortize append
+            # dispatch using one extend per output column.
+            local_ptrs, remote_ptrs, transfer_sizes = _build_block_transfer_addresses(
+                local_block_groups,
+                remote_block_groups,
+                local_base_addr,
+                remote_base_addr,
+                local_block_stride,
+                remote_block_stride,
+                transfer_len,
+                local_inner_offset,
+                remote_inner_offset,
+            )
+            local_destinations.extend(local_ptrs)
+            remote_sources.extend(remote_ptrs)
+            lengths.extend(transfer_sizes)
+            if transfer_targets is not None:
+                assert local_target is not None
+                transfer_targets.extend([local_target] * group_count)
+            return
         for local_block_group, remote_block_group in zip(local_block_groups, remote_block_groups):
-            src_list.append(local_base_addr + local_block_group[0] * local_block_stride + local_inner_offset)
-            dst_list.append(remote_base_addr + remote_block_group[0] * remote_block_stride + remote_inner_offset)
-            length_list.append(transfer_len * len(local_block_group))
+            local_destinations.append(local_base_addr + local_block_group[0] * local_block_stride + local_inner_offset)
+            remote_sources.append(remote_base_addr + remote_block_group[0] * remote_block_stride + remote_inner_offset)
+            lengths.append(transfer_len * len(local_block_group))
+            if transfer_targets is not None:
+                assert local_target is not None
+                transfer_targets.append(local_target)
 
     def _append_spec_transfer_addresses(
         self,
@@ -945,9 +1057,10 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         remote_dcp_size: int,
         transfer_entries_by_layer: dict[tuple[int, int], list[tuple[str, list[int], list[int]]]],
         remote_metadata: MooncakePPTransferMetadata,
-        src_list: list[int],
-        dst_list: list[int],
-        length_list: list[int],
+        local_destinations: list[int],
+        remote_sources: list[int],
+        lengths: list[int],
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = None,
     ) -> None:
         """Append all layers and requests belonging to one local spec."""
         spec = self.kv_cache_specs[spec_index]
@@ -959,9 +1072,9 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                 remote_tp_size,
                 transfer_entries_by_layer,
                 remote_metadata,
-                src_list,
-                dst_list,
-                length_list,
+                local_destinations,
+                remote_sources,
+                lengths,
             )
             return
 
@@ -982,19 +1095,46 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         if not any(local_block_ids for local_block_ids, _ in block_ids_by_request.values()):
             return
 
-        single_block_ids_by_request = {
-            request_id: (
-                [[block_id] for block_id in local_block_ids],
-                [[block_id] for block_id in remote_block_ids],
+        # These caches belong to this spec call only. The validation above
+        # guarantees that each request has the same block mapping in all layers.
+        block_groups_by_mode: dict[tuple[bool, bool], dict[str, tuple[list[list[int]], list[list[int]]]]] = {}
+        host_kv = getattr(self, "_sfa_host_kv", None)
+
+        def get_block_groups(
+            coalesce: bool,
+            local_base_addr: int,
+            local_target: DSAPDMooncakeTransferTarget | None,
+        ) -> dict[str, tuple[list[list[int]], list[list[int]]]]:
+            offloaded = getattr(local_target, "offloaded", None)
+            shared_host = host_kv is not None and (
+                host_kv.contains(local_base_addr) if offloaded is None else offloaded
             )
-            for request_id, (local_block_ids, remote_block_ids) in block_ids_by_request.items()
-        }
-        contiguous_block_ids_by_request = {
-            request_id: group_concurrent_contiguous(local_block_ids, remote_block_ids)
-            for request_id, (local_block_ids, remote_block_ids) in block_ids_by_request.items()
-        }
+            key = (coalesce, shared_host)
+            prepared = block_groups_by_mode.get(key)
+            if prepared is None:
+                prepared = {}
+                for request_id, (local_block_ids, remote_block_ids) in block_ids_by_request.items():
+                    if shared_host:
+                        assert host_kv is not None
+                        # Ownership already sorts and coalesces the original pairs;
+                        # grouping them before that only creates work to undo.
+                        groups = partition_shared_block_groups(
+                            [local_block_ids], [remote_block_ids], host_kv.rank, host_kv.size, coalesce=coalesce
+                        )
+                    elif coalesce:
+                        groups = group_concurrent_contiguous(local_block_ids, remote_block_ids)
+                    else:
+                        groups = (
+                            [[block_id] for block_id in local_block_ids],
+                            [[block_id] for block_id in remote_block_ids],
+                        )
+                    prepared[request_id] = groups
+                block_groups_by_mode[key] = prepared
+            return prepared
+
         remote_tp_metadata = remote_metadata.metadata_by_pcp_rank[remote_pcp_rank].metadata_by_tp_rank[remote_tp_rank]
-        transfer_whole_block = is_circular_kv_cache_spec(spec) or isinstance(
+        circular_cache = is_circular_kv_cache_spec(spec)
+        transfer_whole_block = circular_cache or isinstance(
             spec,
             (MLAAttentionSpec, SlidingWindowMLASpec, AscendSFAIndexerCacheSpec),
         )
@@ -1010,7 +1150,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                 for cache_index, (local_base_addr, remote_base_addr) in enumerate(
                     zip(local_base_addrs, remote_base_addrs)
                 ):
-                    if is_circular_kv_cache_spec(spec):
+                    if circular_cache:
                         local_shape = self.block_shapes[local_layer_index][cache_index]
                         remote_shape = remote_metadata.block_shapes[remote_layer_index][cache_index]
                         if local_shape != remote_shape:
@@ -1029,10 +1169,14 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                             f"{self.layer_names[local_layer_index]!r}, cache {cache_index}: "
                             f"local={local_block_len}, remote={remote_block_len}"
                         )
-                    block_ids_to_transfer = (
-                        contiguous_block_ids_by_request
-                        if local_block_stride == remote_block_stride == local_block_len
-                        else single_block_ids_by_request
+                    if local_block_len <= 0:
+                        continue
+                    local_target = None
+                    if transfer_targets is not None:
+                        assert self._transfer_targets is not None
+                        local_target = self._transfer_targets[local_layer_index][cache_index]
+                    block_ids_to_transfer = get_block_groups(
+                        local_block_stride == remote_block_stride == local_block_len, local_base_addr, local_target
                     )
                     for request_id, _, _ in transfer_entries:
                         local_block_groups, remote_block_groups = block_ids_to_transfer[request_id]
@@ -1044,9 +1188,11 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                             local_block_stride=local_block_stride,
                             remote_block_stride=remote_block_stride,
                             transfer_len=local_block_len,
-                            src_list=src_list,
-                            dst_list=dst_list,
-                            length_list=length_list,
+                            local_destinations=local_destinations,
+                            remote_sources=remote_sources,
+                            lengths=lengths,
+                            transfer_targets=transfer_targets,
+                            local_target=local_target,
                         )
             return
 
@@ -1151,13 +1297,19 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                         f"cache {cache_index}: local={local_head_len}, remote={remote_head_len}"
                     )
                 transfer_len = num_transfer_heads * local_head_len
+                if transfer_len <= 0:
+                    continue
                 local_inner_offset = local_head_offset * local_head_len
                 remote_inner_offset = remote_head_offset * remote_head_len
-                block_ids_to_transfer = (
-                    contiguous_block_ids_by_request
-                    if local_block_stride == local_block_len == transfer_len
-                    and remote_block_stride == remote_block_len == transfer_len
-                    else single_block_ids_by_request
+                local_target = None
+                if transfer_targets is not None:
+                    assert self._transfer_targets is not None
+                    local_target = self._transfer_targets[local_layer_index][cache_index]
+                block_ids_to_transfer = get_block_groups(
+                    local_block_stride == local_block_len == transfer_len
+                    and remote_block_stride == remote_block_len == transfer_len,
+                    local_base_addr,
+                    local_target,
                 )
                 for request_id, _, _ in transfer_entries:
                     local_block_groups, remote_block_groups = block_ids_to_transfer[request_id]
@@ -1171,9 +1323,11 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                         transfer_len=transfer_len,
                         local_inner_offset=local_inner_offset,
                         remote_inner_offset=remote_inner_offset,
-                        src_list=src_list,
-                        dst_list=dst_list,
-                        length_list=length_list,
+                        local_destinations=local_destinations,
+                        remote_sources=remote_sources,
+                        lengths=lengths,
+                        transfer_targets=transfer_targets,
+                        local_target=local_target,
                     )
 
     def _execute_tp_transfer_bucket(
@@ -1189,15 +1343,26 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
             int,
             dict[tuple[int, int], list[tuple[str, list[int], list[int]]]],
         ],
+        *,
+        sfa_requests: dict[str, ReqMeta] | None = None,
     ) -> None:
         """Calculate addresses and execute one remote PP/PCP/TP transfer bucket.
 
         ``transfer_entries_by_spec`` maps local spec index to layer-index pairs,
         then to ``(request_id, local_block_ids, remote_block_ids)`` records.
         """
-        src_list: list[int] = []
-        dst_list: list[int] = []
-        length_list: list[int] = []
+        local_destinations: list[int] = []
+        remote_sources: list[int] = []
+        lengths: list[int] = []
+        # Preserve local target identities alongside the computed addresses.
+        # Mamba's distinct state-copy layout keeps its existing generic path.
+        transfer_targets: list[DSAPDMooncakeTransferTarget] | None = (
+            []
+            if self.staging_reader is not None
+            and getattr(self, "_transfer_targets", None) is not None
+            and not any(isinstance(self.kv_cache_specs[i], MambaSpec) for i in transfer_entries_by_spec)
+            else None
+        )
         for spec_index, transfer_entries_by_layer in transfer_entries_by_spec.items():
             self._append_spec_transfer_addresses(
                 spec_index=spec_index,
@@ -1208,14 +1373,36 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                 remote_dcp_size=remote_dcp_size,
                 transfer_entries_by_layer=transfer_entries_by_layer,
                 remote_metadata=remote_metadata,
-                src_list=src_list,
-                dst_list=dst_list,
-                length_list=length_list,
+                local_destinations=local_destinations,
+                remote_sources=remote_sources,
+                lengths=lengths,
+                transfer_targets=transfer_targets,
             )
 
-        if not src_list:
+        if not local_destinations and sfa_requests is None:
             return
         tp_metadata = remote_metadata.metadata_by_pcp_rank[remote_pcp_rank].metadata_by_tp_rank[remote_tp_rank]
+        if sfa_requests is not None:
+            host_kv = self._sfa_host_kv
+            for entries_by_layer in transfer_entries_by_spec.values():
+                for (local_index, remote_index), entries in entries_by_layer.items():
+                    name = self.layer_names[local_index]
+                    if name not in host_kv.hot_caches:
+                        continue
+                    for request_id in dict.fromkeys(entry[0] for entry in entries):
+                        host_kv.append_prefill_reads(
+                            name,
+                            sfa_requests[request_id],
+                            tp_metadata.kv_caches_base_addr[remote_index],
+                            remote_metadata.block_strides[remote_index],
+                            remote_metadata.block_lens[remote_index],
+                            local_destinations,
+                            remote_sources,
+                            lengths,
+                            transfer_targets,
+                        )
+        if not local_destinations:
+            return
         session_id = f"{tp_metadata.local_ip}:{tp_metadata.te_rpc_port}"
         request_ids = sorted(
             {
@@ -1226,20 +1413,37 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
             }
         )
         transfer_start_time = time.perf_counter()
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        if self.staging_reader is None:
+            ret = self.engine.batch_transfer_sync_read(session_id, local_destinations, remote_sources, lengths)
+        else:
+            # Success includes landing and event drain, before completion can
+            # release the producer's blocks or make Host KV visible to decode.
+            ret = self.staging_reader.batch_transfer_sync_read(
+                session_id,
+                local_destinations,
+                remote_sources,
+                lengths,
+                ",".join(request_ids),
+                **({"transfer_targets": transfer_targets} if transfer_targets is not None else {}),
+            )
         if ret < 0:
             raise RuntimeError(
                 "Mooncake KV transfer failed for remote "
                 f"PP/PCP/TP rank {remote_pp_rank}/{remote_pcp_rank}/{remote_tp_rank}, ret={ret}"
             )
+        self._log_transfer_bucket(request_ids, session_id, lengths, transfer_start_time)
+
+    def _log_transfer_bucket(
+        self, request_ids: list[str], session_id: str, lengths: list[int], transfer_start_time: float
+    ) -> None:
         transfer_elapsed_ms = (time.perf_counter() - transfer_start_time) * 1000
         logger.info(
             "KV cache transfer for requests %s took %.2f ms (%d ranges, %d bytes). "
             "local_ip %s local_device_id %s remote_session_id %s",
             request_ids,
             transfer_elapsed_ms,
-            len(length_list),
-            sum(length_list),
+            len(lengths),
+            sum(lengths),
             self.local_metadata.local_ip,
             self.tp_rank,
             session_id,
@@ -1368,9 +1572,17 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
     ) -> None:
         """Register caches and start the D-side pull execution thread."""
         super().register_kv_caches(kv_caches)
+        self._sfa_pd_state = None
         if self.kv_transfer_config.is_kv_consumer:
             if not isinstance(self.xfer_handshake_metadata, MooncakeTransferMetadata):
                 raise RuntimeError("Mooncake KV caches were registered without transfer metadata")
+            staging_reader = None
+            host_kv = getattr(self, "_sfa_host_kv", None)
+            if host_kv is not None:
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_v2 import MooncakeSFAPDState
+
+                staging_reader = MooncakeSFAStagingReader(self.engine, host_kv, self.xfer_handshake_metadata.block_lens)
+                self._sfa_pd_state = MooncakeSFAPDState(host_kv.main_group_id)
             ready_event = threading.Event()
             self._recving_thread = MooncakePullRecvingThread(
                 engine=self.engine,
@@ -1392,6 +1604,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
                 dcp_size=self.dcp_size,
                 device=torch.npu.current_device(),
                 ready_event=ready_event,
+                staging_reader=staging_reader,
             )
             self._recving_thread.start()
             if not ready_event.wait(timeout=10):
@@ -1399,15 +1612,25 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             if not self._recving_thread.is_alive():
                 raise RuntimeError("Mooncake pull receiving thread failed to start")
 
+    def prepare_sparse_kv_offload(self, metadata: MooncakeConnectorMetadata) -> None:
+        """Publish row reservations before MRV2 prepares attention metadata."""
+        state = getattr(self, "_sfa_pd_state", None)
+        if state is not None:
+            state.bind_metadata(metadata)
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         """Start the pull operations described by scheduler metadata."""
+        self.prepare_sparse_kv_offload(metadata)
         if not metadata.requests:
             return
         if self.kv_transfer_config.is_kv_consumer:
             assert self._recving_thread is not None
             request_groups: dict[str, dict[str, ReqMeta]] = {}
+            state = getattr(self, "_sfa_pd_state", None)
             for request_id, request_metadata in metadata.requests.items():
                 requests = request_groups.setdefault(request_metadata.remote_engine_id, {})
+                if state is not None and request_metadata.copy_sfa_slot != state.bindings[request_id]:
+                    raise ValueError("Mooncake V2 SFA PD transfer differs from its reserved hot row")
                 requests[request_id] = request_metadata
 
             for remote_engine_id, requests in request_groups.items():
@@ -1415,11 +1638,15 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
 
     def get_transfer_results(self) -> KVConnectorTransferResults:
         """Return completed receives, including their failure status."""
-        return (
+        results = (
             self._recving_thread.get_and_clear_finished_requests()
             if self._recving_thread is not None
             else KVConnectorTransferResults()
         )
+        state = getattr(self, "_sfa_pd_state", None)
+        if state is not None:
+            state.record_received(results.finished_recving, results.failed_recving)
+        return results
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return local block IDs whose pull operations failed."""

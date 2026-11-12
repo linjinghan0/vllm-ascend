@@ -1716,9 +1716,12 @@ def test_consumer_always_starts_heartbeat_with_configured_interval(monkeypatch, 
         is_kv_consumer=True,
         get_from_extra_config=extra.get,
     )
-    monkeypatch.setattr(
-        MooncakeBaseConnectorScheduler, "__init__", lambda self, *args: setattr(self, "kv_transfer_config", config)
-    )
+
+    def init_scheduler(self, *args):
+        self.kv_transfer_config = config
+        self.ascend_config = SimpleNamespace(sparse_kv_offload_config=None)
+
+    monkeypatch.setattr(MooncakeBaseConnectorScheduler, "__init__", init_scheduler)
     receiver = MagicMock()
 
     def create_receiver(ready):
